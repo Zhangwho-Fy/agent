@@ -1,0 +1,45 @@
+[project]
+name = "agent"
+version = "0.1.0"
+description = "本地代码库助手 Agent：可持久化、可恢复、可重放、可评测"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.60",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "typer>=0.12",
+    "rich>=13.9",
+]
+
+[project.scripts]
+agent = "agent.client.main:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+# 注释和文档字符串用中文，全角标点是正常写法，不是拼写事故
+ignore = ["RUF001", "RUF002", "RUF003"]
