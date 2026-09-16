@@ -15,7 +15,7 @@ def test_create_fills_envelope() -> None:
         session_id="sess_1",
         seq=7,
         type=EventType.TOOL_CALL,
-        data={"name": "fs.read"},
+        data={"name": "fs_read"},
         turn_id="turn_1",
     )
 
@@ -23,7 +23,7 @@ def test_create_fills_envelope() -> None:
     assert event.seq == 7
     assert event.type is EventType.TOOL_CALL
     assert event.turn_id == "turn_1"
-    assert event.data == {"name": "fs.read"}
+    assert event.data == {"name": "fs_read"}
     assert event.ts.tzinfo is not None
 
 

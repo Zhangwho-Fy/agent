@@ -5,6 +5,9 @@ description = "本地代码库助手 Agent：可持久化、可恢复、可重�
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "langgraph>=1.2",
+    "langchain-core>=1.6",
+    "langchain-deepseek>=1.1",
     "openai>=1.60",
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
@@ -12,6 +15,7 @@ dependencies = [
     "uvicorn>=0.32",
     "typer>=0.12",
     "rich>=13.9",
+    "langgraph-checkpoint-sqlite>=3.1.1",
 ]
 
 [project.scripts]

@@ -17,6 +17,10 @@ _STANDARD_ATTRS = frozenset(
     vars(logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None))
 ) | {"message", "asctime"}
 
+# 这些库在 info 级会把每个 HTTP 请求都打出来，CLI 输出会被冲散。
+# 我们自己的关键信息走 "agent.*" 命名空间，不受影响。
+_NOISY_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "openai", "langsmith")
+
 
 class JsonFormatter(logging.Formatter):
     """把 LogRecord 渲染成一行 JSON。"""
@@ -45,3 +49,6 @@ def configure_logging(level: str = "info", *, stream: IO[str] | None = None) -> 
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level.upper())
+
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
