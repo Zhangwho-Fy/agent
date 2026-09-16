@@ -9,7 +9,10 @@
 | --- | --- | --- | --- |
 | 语言 | Python 3.12 | 3.10 / 3.11 | `X \| None`、`StrEnum`、`TaskGroup`、`asyncio.timeout` 等现代语法；系统自带的 3.8 已停止维护 |
 | 环境与依赖 | uv | pip + venv | 装依赖快一个量级，顺带管 Python 版本 |
-| 模型接入 | `openai` SDK（OpenAI 兼容协议） | 各家自研 SDK | DeepSeek 兼容 OpenAI 协议，换供应商只改 `base_url` + 模型名 |
+| **编排层** | **LangGraph 1.2** | 自研状态机 | 状态、条件边、checkpointer、interrupt、stream modes 都是行业标准；编排不是本项目的差异化，自研等于重造轮子 |
+| 模型接入 | `langchain-deepseek`（底层 `langchain-openai` + `openai` SDK） | 直接用 `openai` SDK | 官方适配一行接上 DeepSeek，换供应商只改一行；录放走同一个模型接口 |
+| 检索组件 | LangChain（splitter / retriever / vector store 适配） | 自己写 | 通用基础设施用现成的；**但检索指标与评测自己写** |
+| 事实源与对外契约 | 自研：事件日志 + SQLite | 全部交给 checkpointer | 框架没有"对外事件流 + 幂等 + 续传 + 审计"这套抽象，这正是本项目的差异化 |
 | 数据模型 / 配置 | pydantic v2 + pydantic-settings | dataclass | 校验、序列化、从环境变量读配置全都免费 |
 | HTTP 服务 | FastAPI + uvicorn | 标准库 `http.server` | 流式响应（SSE）实现干净，类型标注即接口文档 |
 | CLI | Typer | argparse | 类型标注即参数定义，风格与 pydantic 统一 |
@@ -25,39 +28,40 @@
 
 | 组件 | 职责 | 不做什么 |
 | --- | --- | --- |
-| `core` | 消息 / 事件模型、主循环、prompt 组装、上下文压缩 | 不碰网络、不碰文件系统、不 import 具体 provider |
-| `providers` | 调用模型 API、重试与退避、超时、用量统计 | 不做 prompt 组装、不执行工具 |
-| `tools` | 工具注册、参数 schema、执行、超时、输出截断 | 不判定审批（交给 `policy`） |
-| `policy` | 工具三级分类、审批请求、危险操作拦截 | 不执行命令 |
-| `retrieval` | 切块、索引构建与增量更新、混合检索 | 不直接调模型 |
-| `store` | 会话 / 消息 / 事件 / 工具调用持久化 | 不含业务逻辑 |
+| `graph` | LangGraph 编排：图状态、模型节点、工具节点、条件边、checkpointer 与 interrupt 接线 | 不执行工具、不写事件日志 |
+| `core` | 消息 / 事件模型、prompt 组装、**可靠性语义**（事件日志、幂等、seq、恢复、对外事件流） | 不碰网络与文件系统，不 import 具体模型 |
+| `models` | LangChain 模型适配（`ChatDeepSeek`）、录放包装、重试与用量统计 | 不做 prompt 组装、不执行工具 |
+| `tools` | 工具注册、参数 schema、执行、超时、输出截断（暴露为 LangChain Tool） | 不判定审批（交给 `policy`） |
+| `policy` | 三级分类、审批请求、危险操作拦截（接 LangGraph `interrupt`） | 不执行命令 |
+| `retrieval` | 切块、索引构建与增量更新、混合检索（用 LangChain 的切分器/retriever） | 不直接调模型 |
+| `store` | 会话 / 消息 / 事件 / 工具调用持久化（对外事实源） | 不含业务逻辑 |
 | `server` | HTTP 路由、SSE、token 认证 | 不含 agent 逻辑 |
 | `client` | CLI 交互、流式渲染、审批提示 | 不直接访问数据库 |
 
-依赖方向单向：`client / server → core → {providers, tools, retrieval, store}`。
-`core` 只依赖 Protocol 抽象，具体实现在启动时装配（依赖注入），这也是能用回放 provider 替换真实 provider 的原因。
+依赖方向单向：`client / server → graph → {core, models, tools, retrieval, store}`。
+`graph` 只依赖 `core` 的契约与各层的接口，具体实现在启动时装配（依赖注入）——这既让测试能换成回放模型，也让"换编排实现"成为可能。
 
 ### 2.2 一次 turn 的数据流
 
 1. CLI 发 `POST /sessions/{id}/messages`，带 `idempotency_key`。
 2. server 校验 token → 查幂等键，命中则直接返回原 `turn_id`（不重复执行）。
-3. 用户消息落库并分配会话内递增 `seq`。
-4. 写 `turn.started` 事件 → **先落库，再推送** → 返回 `202 {"turn_id": ...}`。
-5. core 组装上下文（系统提示 + 历史消息 + 本次输入）并附上工具清单。
-6. `provider.stream()` 逐块产出：文本增量 → 发 `text.delta`；工具调用增量 → 累积成完整 `ToolCall`。
-7. 若本轮有工具调用：发 `tool.call` → `policy` 分类：
+3. 用户消息落库并分配会话内递增 `seq`；写 `turn.started` 事件 → **先落库，再推送** → 返回 `202 {"turn_id": ...}`。
+4. 调用 `graph.astream(...)`（`stream_mode=["messages", "updates", "custom"]`）驱动一轮对话，**用同一个线程 ID 关联 checkpointer 里的图状态**。
+5. 模型节点产出：文本增量 → `bridge` 映射成 `text.delta`；工具调用请求 → 映射成 `tool.call`。
+6. 工具节点执行前问 `policy` 分级：
    - 只读 → 直接执行
-   - 写操作 → 发 `approval.required`，等客户端 `POST /approvals/{call_id}`（超时按拒绝处理）
+   - 写操作 → 节点内 `interrupt()` 挂起图，发 `approval.required`；客户端 `POST /approvals/{call_id}` 后用 `Command(resume=...)` 恢复（超时按拒绝处理，超时逻辑是我们自己加的，框架只提供挂起/恢复）
    - 危险 → 直接拒绝，把拒绝原因回填给模型
-8. 执行工具 → 发 `tool.result`（**截断版进模型上下文，全量入库**）。
-9. 工具结果作为 `tool` 消息追加进上下文，回到第 5 步，最多 `max_tool_rounds` 轮。
-10. 模型不再请求工具 → 发 `text.done` 与 `turn.done`（含 token 用量、耗时）。
-11. SSE 消费者按 `seq` 推送；客户端断线重连带 `Last-Event-ID`，服务端从 DB 补齐缺口。
-12. CLI 渲染：文本流式打印，工具调用折叠成一行摘要，审批请求变成交互式确认。
+7. 执行工具 → `tool.result`（**截断版进图状态，全量入库**）；条件边判断是否回到模型节点，直到没有工具调用或达到 `recursion_limit`。
+8. 结束：发 `text.done` 与 `turn.done`（含 token 用量、耗时）；checkpointer 落一次检查点。
+9. SSE 消费者按 `seq` 推送；客户端断线重连带 `Last-Event-ID`，服务端从 DB 补齐缺口。
+10. CLI 渲染：文本流式打印，工具调用折叠成一行摘要，审批请求变成交互式确认。
+
+**两套持久化并存，各管一段**：checkpointer 存的是**图的运行态**（给框架恢复用），`store` 存的是**对外事件流与审计**（给客户端、重放、评测用）。它们不重复：前者可以随时丢弃，后者是事实源。
 
 ### 2.3 并发模型
 
-- **单事件循环。** server 收到消息后 `asyncio.create_task(loop.run_turn(...))`，立刻返回 202，不等结果。
+- **单事件循环。** server 收到消息后 `asyncio.create_task(run_turn(...))`（内部驱动 `graph.astream`），立刻返回 202，不等结果。
 - **会话内串行**：每个会话一把 `asyncio.Lock`，同一会话的 turn 不会交错。
 - **会话间并行**：不同会话互不阻塞。
 - **工具执行**：`asyncio.create_subprocess_exec` + `asyncio.timeout`；stdout/stderr 边读边截断，避免大输出把内存吃满。
@@ -77,11 +81,15 @@
 
 ### 2.5 关键决策与理由
 
-1. **事件先落库再推送**——否则客户端补齐时会缺事件；顺序反了就出现"看到过但查不到"。
-2. **SSE 而非 WebSocket**——本场景是服务端单向推流，SSE 更简单、可 `curl` 调试、断线重连语义天然（`Last-Event-ID`）。
-3. **工具输出截断但全量入库**——模型只看头尾各 4KB，省钱且避免上下文被一条 `ls -R` 冲爆；人要排查时能从库里看全文。
-4. **审批超时视为拒绝**——安全默认值，避免"没人看所以放行"。
-5. **不引 LangChain**——主循环是本项目的核心价值，引框架则面试无从谈起；只借 `openai` SDK 的 HTTP 客户端。
+1. **编排用 LangGraph，不自研**——状态机、条件边、检查点、人工介入、流式模式都是行业标准件，社区已经把边界情况磨过一遍；本项目的价值在框架**不覆盖**的语义层，自研编排属于重造轮子。
+2. **但对外契约自己写**——事件日志、seq 续传、幂等键、审计明细，框架里没有对应抽象。不做这层，项目就退化成"照教程搭的 demo"。
+3. **checkpointer 与事件日志并存**——前者是框架的运行时状态（可丢弃、可重建），后者是对外事实源（可重放、可评测）。两者职责不同，不是重复建设。
+4. **录放用自定义 `BaseChatModel`**——继承 LangChain 的模型基类做录制/回放，比 monkeypatch 或替换 HTTP 层更稳：图与工具节点完全不知道自己在回放。
+5. **事件先落库再推送**——否则客户端补齐时会缺事件；顺序反了就出现"看到过但查不到"。
+6. **SSE 而非 WebSocket**——服务端单向推流，SSE 更简单、可 `curl` 调试、断线重连语义天然（`Last-Event-ID`）。
+7. **工具输出截断但全量入库**——模型只看头尾各 4KB，省钱且避免上下文被一条 `ls -R` 冲爆；人要排查时能从库里看全文。
+8. **审批超时视为拒绝**——框架只提供挂起与恢复，超时判断与默认值是我们加的安全语义。
+9. **沙箱与边界自己做**——框架不管工具怎么执行：工作区 realpath 边界、进程组超时、环境变量白名单、危险命令拦截都在 `tools` + `policy`。
 
 ## 3. 目录结构
 
@@ -99,23 +107,26 @@ agent/
 │   ├── __init__.py
 │   ├── config.py              Settings（pydantic-settings），从 .env + 环境变量加载
 │   ├── logging.py             结构化日志配置（JSON 行）
+│   ├── graph/                 LangGraph 编排
+│   │   ├── state.py           图状态定义（消息、工具结果、用量、中断标记）
+│   │   ├── nodes.py           模型节点、工具节点、审批节点
+│   │   ├── builder.py         组装 StateGraph，接 checkpointer 与 interrupt
+│   │   └── bridge.py          把框架的流事件映射成我们的事件（关键适配层）
 │   ├── core/
 │   │   ├── events.py          事件类型、Event 模型、序列化
-│   │   ├── messages.py        Message / ToolCall / ToolResult 模型
+│   │   ├── messages.py        Message / ToolCall 模型
 │   │   ├── bus.py             EventBus：订阅、广播、有界队列
-│   │   ├── loop.py            AgentLoop：主循环（模型↔工具）
+│   │   ├── reliability.py     幂等键、seq 分配、崩溃恢复（阶段 2）
 │   │   ├── prompt.py          系统提示组装、上下文压缩
 │   │   └── errors.py          异常层次
-│   ├── providers/
-│   │   ├── base.py            Provider Protocol、Chunk 类型
-│   │   ├── openai_compat.py   OpenAI 兼容实现（DeepSeek）
-│   │   ├── replay.py          录制回放实现（测试与离线演示）
-│   │   └── recorder.py        把真实响应录成 fixtures
+│   ├── models/
+│   │   ├── factory.py         按配置构建 ChatDeepSeek / 回放模型
+│   │   └── recording.py       录放包装（继承 BaseChatModel）+ fixtures 读写
 │   ├── tools/
 │   │   ├── base.py            Tool Protocol、ToolSpec、ToolContext、ToolResult
 │   │   ├── registry.py        注册与查找、导出模型可用的 schema
-│   │   ├── fs.py              fs.read / fs.list / fs.write
-│   │   ├── shell.py           shell.exec（超时、进程组、输出截断）
+│   │   ├── fs.py              fs_read / fs_list / fs.write
+│   │   ├── shell.py           shell_exec（超时、进程组、输出截断）
 │   │   ├── search.py          代码检索工具（第 5 阶段接入 retrieval）
 │   │   └── policy.py          三级分类、审批流转、危险命令拦截
 │   ├── retrieval/             第 5 阶段
@@ -238,7 +249,7 @@ CREATE TABLE idempotency (
   "session_id": "sess_01J...",
   "turn_id": "turn_01J...",
   "type": "tool.call",
-  "data": {"call_id": "call_1", "name": "fs.read", "args": {"path": "src/app.py"}},
+  "data": {"call_id": "call_1", "name": "fs_read", "args": {"path": "src/app.py"}},
   "ts": "2026-09-16T10:00:00.123Z"
 }
 ```
@@ -354,7 +365,7 @@ class AgentLoop:
 
 | 级别 | 例子 | 行为 |
 | --- | --- | --- |
-| `read` | `fs.read`、`fs.list`、`search_code`、`shell.exec` 只读白名单（`ls`、`cat`、`git status`、`git diff`、`grep`） | 自动执行 |
+| `read` | `fs_read`、`fs_list`、`search_code`、`shell_exec` 只读白名单（`ls`、`cat`、`git status`、`git diff`、`grep`） | 自动执行 |
 | `write` | `fs.write`、`git add/commit`、跑测试、装依赖 | 发审批事件，等客户端确认 |
 | `dangerous` | `rm -rf`、`sudo`、`git push --force`、写工作区外路径、读 `.env`/密钥文件、管道下载执行 | 直接拒绝，回填拒绝原因 |
 
@@ -379,7 +390,7 @@ class AgentLoop:
 | 层次 | 覆盖内容 | 是否联网 | 是否需 key |
 | --- | --- | --- | --- |
 | 单元测试 | 策略判定、输出截断、切块、RRF、事件序列化 | 否 | 否 |
-| 回放测试 | 主循环、工具往返、审批流转、恢复逻辑（用 `fixtures/` 录制响应） | 否 | 否 |
+| 回放测试 | 图编排、工具往返、审批流转、恢复逻辑（自定义 `BaseChatModel` 回放 `fixtures/`） | 否 | 否 |
 | 评测 | golden 任务集通过率、检索指标 | 否（回放） | 否 |
 | 冒烟测试 | 真实 API 走一次最小任务 | 是 | 是（手动触发） |
 
@@ -389,23 +400,25 @@ CI 只跑前三层，因此**永远不需要密钥**；真实调用只在本地�
 
 | 编号 | 任务 | 负责人 |
 | --- | --- | --- |
-| 1.0 | 项目骨架：`pyproject.toml`、包结构、`.env.example`、日志、config | 我 |
-| 1.1 | 模型接口连通性烟测（确认 DeepSeek 的端点形态） | 我 |
-| 1.2 | `Provider` Protocol + `replay` 实现 | 我 |
-| 1.3 | `openai_compat` 真实实现（流式 + 工具调用增量拼装） | 我 |
-| 1.4 | 事件模型 + `EventBus`（内存版） | 我 |
-| 1.5 | 工具：`fs.read` / `fs.list` / `shell.exec` | `shell.exec` 你写，其余我写 |
-| 1.6 | 工具策略与三级分类的骨架 | 我 |
-| 1.7 | `AgentLoop.run_turn` 主循环 | 你写（我给骨架和讲解） |
-| 1.8 | CLI 最小版：单会话、流式打印、工具调用折叠显示 | 我 |
-| 1.9 | 一次真实任务的冒烟演示 + 首次 commit | 一起 |
+| 1.0 | 骨架与配置（**已完成**）：pyproject、config、logging、CLI 三命令 | 我 |
+| 1.1 | 模型连通性烟测（**已完成**）：`chat.completions` + 流式工具调用可用 | 我 |
+| 1.2 | 依赖接入：`langgraph` / `langchain-deepseek` / `langchain-core` | 我 |
+| 1.3 | 最小图：状态定义 + 模型节点 + 工具节点 + 条件边 | 我 |
+| 1.4 | 三个工具：`fs_read` / `fs_list` / `shell_exec`（超时、进程组、输出截断） | `shell_exec` **你写** |
+| 1.5 | 事件桥：把框架的流映射成 `text.delta` / `tool.call` / `tool.result` | 我 |
+| 1.6 | 工具策略骨架：分级 + 只读自动执行 | 我 |
+| 1.7 | CLI 最小版：单会话、流式打印、工具调用折叠显示 | 我 |
+| 1.8 | 真实任务冒烟演示 + 首次 demo | 一起 |
+| 1.9 | 学习任务：读懂 `graph/builder.py`，能讲清节点与边的走向 | **你** |
 
 ## 11. 风险
 
 | 风险 | 应对 |
 | --- | --- |
-| DeepSeek 端点形态与预期不符（`chat.completions` vs `responses`） | 1.1 先烟测，再定 provider 实现 |
+| 框架版本漂移（LangGraph 1.x 仍在快速演进） | 锁定版本，一次只升一个包；用 `bridge.py` 隔离变化 |
+| 抽象泄漏，细节拦不住时要读框架内部 | 兜底逻辑集中在 `bridge.py`；必要时打补丁而不是绕开 |
+| checkpointer 与事件日志状态不一致 | 明确职责（运行态 vs 事实源）；恢复只以事件日志为准 |
+| `interrupt` 的超时语义要自己加 | 审批节点显式计时，超时按拒绝处理并落事件 |
 | 工具输出过大冲爆上下文 | 截断策略 + 全量入库，单测覆盖边界 |
-| 审批流程把演示卡住 | 只读工具自动执行，演示主线不依赖审批 |
-| 范围膨胀（阶段 5、6 都是大块） | 严格按里程碑推进，每阶段可独立演示 |
-| 你只在 review、不动手 → 面试讲不透 | core loop / 工具执行 / 评测三块必须你写 |
+| 范围膨胀（阶段 5、6 都是大块） | 严格按里程碑推进，每阶段可独立演示；C++ 明确为可选项 |
+| 只在 review、不动手 → 面试讲不透 | `shell_exec` 边界、评测任务设计、每阶段 review 必须你来 |
