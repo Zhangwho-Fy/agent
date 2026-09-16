@@ -13,7 +13,7 @@ def test_log_line_is_single_json_object() -> None:
     buffer = io.StringIO()
     configure_logging("info", stream=buffer)
 
-    logging.getLogger("agent.test").info("工具执行完成", extra={"tool": "fs.read", "ms": 12})
+    logging.getLogger("agent.test").info("工具执行完成", extra={"tool": "fs_read", "ms": 12})
 
     lines = buffer.getvalue().strip().splitlines()
     assert len(lines) == 1
@@ -21,6 +21,19 @@ def test_log_line_is_single_json_object() -> None:
     record = json.loads(lines[0])
     assert record["msg"] == "工具执行完成"
     assert record["level"] == "info"
-    assert record["tool"] == "fs.read"
+    assert record["tool"] == "fs_read"
     assert record["ms"] == 12
     assert record["ts"].endswith("+00:00")
+
+
+def test_noisy_third_party_loggers_are_silenced() -> None:
+    """httpx 在 info 级会把每个请求都打出来，CLI 输出会被冲散。"""
+    buffer = io.StringIO()
+    configure_logging("info", stream=buffer)
+
+    logging.getLogger("httpx2").info("HTTP Request: POST ...")
+    logging.getLogger("agent.tools").info("工具调用完成")
+
+    lines = buffer.getvalue().strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["logger"] == "agent.tools"

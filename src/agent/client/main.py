@@ -9,9 +9,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.metadata
+import json
 import sys
+from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -112,6 +116,93 @@ def show_config() -> None:
     for key, value in settings.describe().items():
         table.add_row(key, value)
     console.print(table)
+
+
+@app.command()
+def run(
+    prompt: Annotated[str, typer.Argument(help="交给 agent 的任务")],
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="工作区目录，默认取配置里的 AGENT_WORKSPACE"),
+    ] = None,
+) -> None:
+    """跑一次任务：驱动 LangGraph 图并在终端流式显示。"""
+    settings = Settings()
+    if workspace is not None:
+        settings.workspace = workspace
+    raise typer.Exit(code=asyncio.run(_run_once(prompt, settings)))
+
+
+async def _run_once(prompt: str, settings: Settings) -> int:
+    """构建图并跑一轮。
+
+    重依赖（langgraph / langchain）在这里才导入，这样 `agent doctor`、`agent config`
+    在没有装齐依赖时也能用——诊断工具本身不该依赖被诊断的东西。
+    """
+    from ..core.bus import EventBus
+    from ..core.events import Event, EventType
+    from ..core.ids import new_id
+    from ..core.reliability import EventEmitter
+    from ..graph.bridge import stream_turn
+    from ..graph.builder import build_graph
+    from ..models.factory import build_chat_model
+    from ..tools.base import ToolContext
+    from ..tools.policy import Policy
+    from ..tools.registry import default_registry
+
+    ctx = ToolContext(
+        workspace=settings.resolved_workspace,
+        timeout_s=settings.tool_timeout_s,
+        output_limit_bytes=settings.output_limit_bytes,
+    )
+    if not ctx.workspace.is_dir():
+        console.print(f"[red]工作区不存在：{ctx.workspace}[/red]")
+        return 2
+
+    registry = default_registry()
+    policy = Policy(ctx.workspace)
+    try:
+        model = build_chat_model(settings)
+    except Exception as exc:
+        console.print(f"[red]模型初始化失败：{exc}[/red]")
+        return 1
+
+    session_id = new_id("sess")
+    turn_id = new_id("turn")
+    emitter = EventEmitter(session_id, EventBus())
+
+    def render(event: Event) -> None:
+        data = event.data
+        if event.type is EventType.TEXT_DELTA:
+            console.print(str(data.get("text", "")), end="", markup=False, highlight=False)
+        elif event.type is EventType.TOOL_CALL:
+            args = json.dumps(data.get("args", {}), ensure_ascii=False)
+            console.print(f"\n[dim]→ {data.get('name')} {args}[/dim]")
+        elif event.type is EventType.TOOL_RESULT:
+            status = data.get("status")
+            extra = f" {data['duration_ms']}ms" if data.get("duration_ms") else ""
+            style = "dim" if status == "ok" else "yellow"
+            console.print(f"[{style}]  ← {status}{extra}[/{style}]")
+        elif event.type is EventType.ERROR:
+            console.print(f"\n[red]错误：{data.get('message')}[/red]")
+
+    emitter.on_event = render
+
+    graph = build_graph(model=model, registry=registry, policy=policy, ctx=ctx, emitter=emitter)
+    tool_names = ", ".join(registry.names)
+    console.print(f"[dim]工作区 {ctx.workspace}｜模型 {settings.model}｜工具 {tool_names}[/dim]")
+    console.print(f"[bold]你[/bold] {prompt}")
+    console.print("[bold]agent[/bold] ", end="")
+
+    await stream_turn(
+        graph=graph,
+        prompt=prompt,
+        emitter=emitter,
+        session_id=session_id,
+        turn_id=turn_id,
+    )
+    console.print()
+    return 0
 
 
 if __name__ == "__main__":
