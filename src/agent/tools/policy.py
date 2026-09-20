@@ -80,6 +80,34 @@ READ_ONLY_SUBCOMMANDS: dict[str, frozenset[str]] = {
 
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||;|\|")
 
+#: 写文件的重定向。放行 `>&1`（合并 stderr）和 `> /dev/null`（丢弃输出）这两种无副作用写法。
+_WRITE_REDIRECT = re.compile(r">(?!\s*/dev/null)(?!&)")
+
+#: 引号里的内容先摘掉再找重定向，避免 `grep '>' file` 这种被误判
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+#: 这些命令的某些选项会写文件：命令 → 一组"看起来只读、其实会写"的选项
+WRITE_SIGNAL_FLAGS: dict[str, tuple[str, ...]] = {
+    "find": (
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    ),
+    "sort": ("-o", "--output"),
+}
+
+#: 有些命令能"在内部"写文件或执行命令，光看命令行看不出重定向，单独拦
+INTERNAL_WRITE_SIGNALS: dict[str, tuple[re.Pattern[str], ...]] = {
+    # awk 能 system() 执行命令，也能 print > "file" 写文件
+    "awk": (re.compile(r"\bsystem\s*\("), re.compile(r"\bprint\b[^|]*>")),
+}
+
 
 class Policy:
     """判断一次工具调用该自动执行、等审批，还是直接拒绝。"""
@@ -127,6 +155,10 @@ class Policy:
 
     @staticmethod
     def _is_read_only_segment(segment: str) -> bool:
+        # 先拦重定向：`cat a.py > b.py` 的第一个词是 cat，光看白名单会漏掉它其实在写文件
+        if _WRITE_REDIRECT.search(_QUOTED.sub("", segment)):
+            return False
+
         try:
             tokens = shlex.split(segment)
         except ValueError:
@@ -138,6 +170,16 @@ class Policy:
             return False
 
         head = Path(tokens[0]).name
+
+        # 再拦"看起来只读、其实会写"的选项，例如 `find . -delete`、`sort -o out.txt`
+        blocked = WRITE_SIGNAL_FLAGS.get(head)
+        if blocked and any(token in blocked for token in tokens[1:]):
+            return False
+
+        internal = INTERNAL_WRITE_SIGNALS.get(head)
+        if internal and any(pattern.search(segment) for pattern in internal):
+            return False
+
         if head in READ_ONLY_COMMANDS:
             return True
         allowed_subcommands = READ_ONLY_SUBCOMMANDS.get(head)

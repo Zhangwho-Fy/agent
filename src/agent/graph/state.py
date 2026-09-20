@@ -14,5 +14,6 @@ from langgraph.graph.message import add_messages
 
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
-    rounds: int
+    rounds: int  # 模型被调用的次数
+    tool_rounds: int  # 工具往返次数：每进一次 tools 节点 +1
     usage: dict[str, int]

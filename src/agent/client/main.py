@@ -144,7 +144,7 @@ async def _run_once(prompt: str, settings: Settings) -> int:
     from ..core.events import Event, EventType
     from ..core.ids import new_id
     from ..core.reliability import EventEmitter
-    from ..graph.bridge import stream_turn
+    from ..graph.bridge import recursion_limit_for, stream_turn
     from ..graph.builder import build_graph
     from ..models.factory import build_chat_model
     from ..tools.base import ToolContext
@@ -172,10 +172,19 @@ async def _run_once(prompt: str, settings: Settings) -> int:
     turn_id = new_id("turn")
     emitter = EventEmitter(session_id, EventBus())
 
+    streamed = False
+
     def render(event: Event) -> None:
+        nonlocal streamed
         data = event.data
         if event.type is EventType.TEXT_DELTA:
+            streamed = True
             console.print(str(data.get("text", "")), end="", markup=False, highlight=False)
+        elif event.type is EventType.TEXT_DONE:
+            # 逐字流已经打过了就不再重复；没有流式分片时（例如轮数用尽的收尾消息）
+            # 在这里补打一次，否则终端上会是空白。
+            if not streamed and data.get("text"):
+                console.print(str(data["text"]), markup=False, highlight=False)
         elif event.type is EventType.TOOL_CALL:
             args = json.dumps(data.get("args", {}), ensure_ascii=False)
             console.print(f"\n[dim]→ {data.get('name')} {args}[/dim]")
@@ -189,7 +198,14 @@ async def _run_once(prompt: str, settings: Settings) -> int:
 
     emitter.on_event = render
 
-    graph = build_graph(model=model, registry=registry, policy=policy, ctx=ctx, emitter=emitter)
+    graph = build_graph(
+        model=model,
+        registry=registry,
+        policy=policy,
+        ctx=ctx,
+        emitter=emitter,
+        max_tool_rounds=settings.max_tool_rounds,
+    )
     tool_names = ", ".join(registry.names)
     console.print(f"[dim]工作区 {ctx.workspace}｜模型 {settings.model}｜工具 {tool_names}[/dim]")
     console.print(f"[bold]你[/bold] {prompt}")
@@ -201,6 +217,7 @@ async def _run_once(prompt: str, settings: Settings) -> int:
         emitter=emitter,
         session_id=session_id,
         turn_id=turn_id,
+        recursion_limit=recursion_limit_for(settings.max_tool_rounds),
     )
     console.print()
     return 0

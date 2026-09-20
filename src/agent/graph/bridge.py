@@ -13,10 +13,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from ..core.events import EventType
 from ..core.reliability import EventEmitter
+
+
+def recursion_limit_for(max_tool_rounds: int) -> int:
+    """按"工具往返次数"换算出 LangGraph 的 `recursion_limit`。
+
+    一次工具往返要占两个 superstep（agent 节点 + tools 节点），再加进入图与收尾的余量。
+    这只是**护栏**（防止图停不下来），真正的业务上限在模型节点里按 `tool_rounds` 数。
+    """
+    return max_tool_rounds * 2 + 4
 
 
 async def stream_turn(
@@ -38,13 +47,27 @@ async def stream_turn(
     }
 
     text_parts: list[str] = []
+    #: 兜底文本：收尾消息（例如轮数用尽时模型节点直接给的那条）不是流式来的，
+    #: 只能从 updates 里拿；正常情况下这里用不上。
+    fallback_text = ""
     status = "done"
     try:
         async for mode, payload in graph.astream(
             inputs, config=config, stream_mode=["messages", "updates"]
         ):
             if mode != "messages":
-                continue  # updates 里的事件由工具节点自己发，避免重复
+                # 事件由工具节点自己发，这里只顺手记下"最终回答"，避免重复推送
+                for node_update in (payload or {}).values():
+                    for message in (node_update or {}).get("messages") or []:
+                        content = getattr(message, "content", "")
+                        if (
+                            isinstance(message, AIMessage)
+                            and not getattr(message, "tool_calls", None)
+                            and isinstance(content, str)
+                            and content
+                        ):
+                            fallback_text = content
+                continue
             chunk, metadata = payload
             if metadata.get("langgraph_node") != "agent":
                 continue
@@ -60,7 +83,7 @@ async def stream_turn(
             turn_id=turn_id,
         )
 
-    final_text = "".join(text_parts)
+    final_text = "".join(text_parts) or fallback_text
     emitter.emit(EventType.TEXT_DONE, {"text": final_text}, turn_id=turn_id)
     emitter.emit(
         EventType.TURN_DONE,

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 
 from ..core.events import EventType
 from ..core.prompt import CODE_SYSTEM_PROMPT
@@ -20,11 +20,31 @@ from ..tools.registry import ToolRegistry
 from .state import AgentState
 
 
-def build_model_node(model: BaseChatModel, registry: ToolRegistry) -> Any:
-    """模型节点：把工具清单绑给模型，收到回复就追加进状态。"""
+def build_model_node(
+    model: BaseChatModel, registry: ToolRegistry, *, max_tool_rounds: int = 12
+) -> Any:
+    """模型节点：把工具清单绑给模型，收到回复就追加进状态。
+
+    **循环上限在这里兜底**：工具往返次数用尽后不再调用模型，直接给一条收尾消息——
+    它没有 `tool_calls`，条件边 `_route` 看到就会走到 END，循环停住。
+    为什么不用 `recursion_limit` 表达这个语义：那数的是 superstep（`agent→tools`
+    一次往返算 2 步），换算关系藏在框架里；这里数的是"工具往返次数"，和配置项同名同义。
+    """
     bound_model = model.bind_tools(registry.to_openai_tools())
 
     async def call_model(state: AgentState) -> dict[str, Any]:
+        if (state.get("tool_rounds") or 0) >= max_tool_rounds:
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            f"已达到本轮工具调用上限（{max_tool_rounds} 次往返），先停下来汇报："
+                            "上面这些工具结果就是目前能拿到的全部信息。"
+                        )
+                    )
+                ]
+            }
+
         messages = [SystemMessage(content=CODE_SYSTEM_PROMPT), *state["messages"]]
         response = await bound_model.ainvoke(messages)
 
@@ -102,6 +122,6 @@ def build_tool_node(
                 },
             )
 
-        return {"messages": results}
+        return {"messages": results, "tool_rounds": (state.get("tool_rounds") or 0) + 1}
 
     return call_tools
