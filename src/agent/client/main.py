@@ -1,7 +1,8 @@
 """CLI 入口（Typer）。
 
-当前只有 `version` / `doctor` / `config` 三个命令，够验证环境与配置。
-`run` / `serve` / `sessions` / `replay` / `eval` 在后续阶段补齐。
+当前有 `version` / `doctor` / `config` / `run` 四个命令：前三个验证环境与配置（不依赖
+langgraph，缺依赖时也能跑），`run` 驱动一次真实任务并在终端流式显示。
+`serve` / `sessions` / `replay` / `eval` 在后续阶段补齐（服务端在阶段 4）。
 
 对照 C++：Typer 相当于给你一个自动生成 `--help` 的参数解析器，
 而参数定义就是函数签名本身——类型标注既是文档也是校验。

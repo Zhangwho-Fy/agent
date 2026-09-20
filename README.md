@@ -15,13 +15,18 @@
 
 ## 当前状态
 
-阶段 0：设计与骨架。代码实现从阶段 1（最小闭环）开始。
+阶段 0（设计与骨架）与阶段 1（最小闭环）已完成：`agent run` 能真实读代码、跑命令、流式回答。
+阶段 2（可靠性层：SQLite 持久化、幂等、崩溃恢复、checkpointer）是下一步，进度见 [AGENTS.md](AGENTS.md) 第 1 节。
 
-## 快速开始（阶段 1 完成后可用）
+## 快速开始
 
 ```bash
-uv sync
-cp .env.example .env        # 填入 AGENT_API_KEY
-uv run agent serve          # 启动本地服务
-uv run agent run "解释一下 src/agent/core/loop.py 里主循环做了什么"
+# 没有 uv 就先装：curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync                     # 建 .venv；国内网络慢时加 UV_HTTP_TIMEOUT=300
+                            # 系统只有 3.13/3.14 时用 uv sync --python 3.12
+cp .env.example .env        # 填入 AGENT_API_KEY，该文件不进 git
+uv run agent doctor         # 体检：Python、依赖、配置、密钥
+uv run agent run "用一句话说明 src/agent/graph/builder.py 里的图是怎么流转的"
 ```
+
+当前只有单进程 CLI（`run` / `doctor` / `config` / `version`）。`agent serve`（HTTP + SSE 服务端）属于阶段 4，尚未实现。

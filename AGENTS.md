@@ -14,8 +14,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 阶段 0（设计） | ✅ 完成 |
-| 阶段 1（最小闭环） | ✅ 代码完成，**2/4 条验收已验证** |
-| 未验证 | ① 流式是逐 token 输出还是被缓冲；② 工具报错后模型能否自我纠正 |
+| 阶段 1（最小闭环） | ✅ 代码完成，**3/4 条验收已验证** |
+| 未验证 | 工具报错后模型能否自我纠正（流式已实测：691 字符的回答产生 399 个 `text.delta`，首尾跨度 0.913s；同样内容直接调 SDK 是 399 chunk / 0.901s） |
 | 下一步 | 阶段 2：可靠性层（SQLite 持久化、幂等、崩溃恢复、checkpointer） |
 | 代码量 | 源码约 1600 行，测试 57 个（全绿），ruff 干净 |
 | 语言 | **纯 Python，没有任何 C++ 代码**（C++ 是阶段 6 的可选加分项，见第 5 节第 6 条） |
@@ -36,9 +36,12 @@ $ agent run "用一句话说明 src/agent/graph/builder.py 里的图是怎么流
 ```bash
 git clone git@github.com:Zhangwho-Fy/agent.git
 cd agent
+# 没有 uv 时先装（官方脚本，装到 ~/.local/bin，之后 source ~/.local/bin/env 或重开终端）：
+#   curl -LsSf https://astral.sh/uv/install.sh | sh
 cp .env.example .env          # 填入 AGENT_API_KEY（从原机器 ~/.codex/config.toml 里
                               # [model_providers.deepseek] 段复制 sk-... ，或去控制台新建）
-UV_HTTP_TIMEOUT=300 uv sync   # 国内网络到 PyPI 慢，超时参数必须加
+UV_HTTP_TIMEOUT=300 uv sync   # 国内网络到 PyPI 慢，超时参数必须加；
+                              # 系统 Python 不是 3.12 时用 uv sync --python 3.12
 .venv/bin/agent doctor        # 体检：Python 版本、依赖、配置、密钥
 .venv/bin/agent run "用一句话说明 src/agent/graph/builder.py 的作用"
 ```
@@ -112,7 +115,7 @@ src/agent/
 
 1. 建 SQLite 表：`sessions` / `messages` / `events` / `turns` / `tool_calls` / `idempotency`（schema 见 detailed-design 4.1）
 2. `EventEmitter` 改成**先落库再推送**（接口不变，换实现）
-3. 接 LangGraph 的 checkpointer：需新依赖 `langgraph-checkpoint-sqlite`（`uv add` 走网络，由人执行）
+3. 接 LangGraph 的 checkpointer：依赖 `langgraph-checkpoint-sqlite` 已在 `pyproject.toml`（`uv sync` 已装好），剩下的是接线
 4. 接审批流：工具节点用 `interrupt()` 挂起，`Command(resume=...)` 恢复，**超时按拒绝**
 5. 崩溃恢复：重启后把 `running` 的 turn 标成 `interrupted`，会话历史可读、可继续
 6. 验收：跑到一半 `kill -9`，重启后会话还在、能续跑；`agent replay <trace>` 不调模型也能还原事件序列
@@ -127,6 +130,7 @@ src/agent/
 | 测试结果受本机影响 | 读到了真实 `.env` / 环境变量 | `Settings(_env_file=None)` + autouse fixture 清 `AGENT_*` |
 | 路径检查被绕过 | 只做字符串前缀判断，没解析软链接 | 一律 `realpath` 后再判边界 |
 | 命令超时后仍有残留进程 | 只杀了父进程 | `start_new_session=True` + `os.killpg` 杀整组 |
+| 循环上限配置不生效 | `AGENT_MAX_TOOL_ROUNDS` 定义了但没人读，`bridge.py` 写死 `recursion_limit=40` | 接线前先知道实际值：40 个 superstep，约 20 次工具往返（`agent→tools` 一次往返算 2 步）；阶段 2 一并接上，注意换算 |
 
 ## 9. 协作约定
 
