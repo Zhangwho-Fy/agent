@@ -17,3 +17,7 @@ class AgentState(TypedDict, total=False):
     rounds: int  # 模型被调用的次数
     tool_rounds: int  # 工具往返次数：每进一次 tools 节点 +1
     usage: dict[str, int]
+    #: 本轮 turn 的 id，工具节点记审计时要用（checkpointer 恢复后仍然拿得到）
+    turn_id: str
+    #: 审批结果：call_id → 是否批准。审批节点写入，工具节点读取
+    approvals: dict[str, bool]

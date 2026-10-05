@@ -1,12 +1,15 @@
 """组装 StateGraph。
 
-形状很简单：
+形状：
 
-    START → agent ──(有工具调用)──→ tools ──→ agent
-              └────(没有工具调用)────→ END
+    START → agent ──(有工具调用)──→ approve ──→ tools ──→ agent
+              └────(没有工具调用)────────────→ END
 
 条件边 `_route` 就是"循环要不要继续"的判据，等价于手写版里的
 `if not tool_calls: return`。
+
+`approve` 只做分级判断、可能在这里 `interrupt()` 挂起；真正的执行在 `tools`。
+分开是因为**挂起恢复时节点会重跑**，而重跑工具执行是灾难。
 """
 
 from __future__ import annotations
@@ -17,10 +20,11 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from ..core.reliability import EventEmitter
+from ..store.db import Database
 from ..tools.base import ToolContext
 from ..tools.policy import Policy
 from ..tools.registry import ToolRegistry
-from .nodes import build_model_node, build_tool_node
+from .nodes import build_approval_node, build_model_node, build_tool_node
 from .state import AgentState
 
 
@@ -44,18 +48,22 @@ def build_graph(
     emitter: EventEmitter,
     max_tool_rounds: int = 12,
     checkpointer: Any | None = None,
+    db: Database | None = None,
 ) -> Any:
     """编译图。
 
-    `checkpointer` 阶段 1 传 None（无持久化），阶段 2 接 SQLite——
-    接线方式不变，这正是用框架的收益。
+    `checkpointer` 传 None 时图不能被中断（`interrupt()` 依赖检查点），
+    所以要用审批流就必须接上它。`db` 用来记工具调用审计，可以不传。
     """
     builder = StateGraph(AgentState)
     builder.add_node("agent", build_model_node(model, registry, max_tool_rounds=max_tool_rounds))
+    builder.add_node("approve", build_approval_node(registry, policy))
     builder.add_node(
-        "tools", build_tool_node(registry=registry, policy=policy, ctx=ctx, emitter=emitter)
+        "tools",
+        build_tool_node(registry=registry, policy=policy, ctx=ctx, emitter=emitter, db=db),
     )
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", _route, {"tools": "tools", "end": END})
+    builder.add_conditional_edges("agent", _route, {"tools": "approve", "end": END})
+    builder.add_edge("approve", "tools")
     builder.add_edge("tools", "agent")
     return builder.compile(checkpointer=checkpointer)

@@ -100,6 +100,81 @@ def test_recursion_limit_leaves_room_for_every_round() -> None:
     assert recursion_limit_for(1) > 2
 
 
+class _EmptyStream:
+    """空的异步迭代器：`async for` 立刻结束。"""
+
+    def __aiter__(self) -> _EmptyStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        raise StopAsyncIteration
+
+
+class RecordingGraph:
+    """假图：只记下 `stream_turn` 传进来的初始状态，不驱动任何节点。"""
+
+    def __init__(self) -> None:
+        self.inputs: dict[str, Any] | None = None
+
+    def astream(self, inputs: Any, config: Any = None, stream_mode: Any = None) -> _EmptyStream:
+        self.inputs = inputs
+        return _EmptyStream()
+
+
+async def test_stream_turn_resets_counters_each_turn() -> None:
+    """计数器是"这一轮用了多少次"的语义。
+
+    接了 checkpointer 之后图状态会跨轮保留，不显式归零的话，
+    第二轮会继承上一轮的 `tool_rounds`，可能开局就判定"已达上限"。
+    """
+    graph = RecordingGraph()
+    emitter = make_emitter()
+
+    await stream_turn(
+        graph=graph,
+        prompt="第二轮",
+        emitter=emitter,
+        session_id="sess_test",
+        turn_id="turn_2",
+    )
+
+    assert graph.inputs is not None
+    assert graph.inputs["rounds"] == 0
+    assert graph.inputs["tool_rounds"] == 0
+
+
+async def test_turn_done_carries_token_usage(tmp_path: Path) -> None:
+    """token 用量要出现在 turn.done 里，否则"算了但丢掉"，记账无从谈起。"""
+    reply = AIMessage(
+        content="答案",
+        usage_metadata={"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
+    )
+    emitter = make_emitter()
+    events = []
+    emitter.on_event = events.append
+    graph = build_graph(
+        model=ScriptedModel([reply]),
+        registry=default_registry(),
+        policy=Policy(tmp_path),
+        ctx=make_ctx(tmp_path),
+        emitter=emitter,
+    )
+
+    await stream_turn(
+        graph=graph,
+        prompt="随便问问",
+        emitter=emitter,
+        session_id="sess_test",
+        turn_id="turn_1",
+    )
+
+    done = next(event for event in events if event.type.value == "turn.done")
+    # 形状按 detailed-design 4.2 的约定：turn.done 带 usage 与 duration_ms
+    assert done.data["usage"]["input_tokens"] == 12
+    assert done.data["usage"]["output_tokens"] == 7
+    assert done.data["duration_ms"] >= 0
+
+
 async def test_graph_stops_after_max_tool_rounds(tmp_path: Path) -> None:
     """模型一直要工具时，图必须在配置的轮数上停住，而不是撞 recursion_limit 崩掉。"""
     model = ScriptedModel([tool_call_reply()])  # 永远要工具

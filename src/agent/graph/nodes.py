@@ -1,7 +1,12 @@
-"""图的节点：模型节点与工具节点。
+"""图的节点：模型节点、审批节点、工具节点。
 
 为什么不用 LangGraph 预置的 `ToolNode`：预置节点直接执行工具，中间没有位置插
 "分级 → 拦截 → 记事件"。而这几步正是本项目要展示的部分，所以工具节点自己写。
+
+**为什么审批单独一个节点**：被 `interrupt()` 挂起的节点，恢复时是**从头重跑**的。
+如果工具节点自己挂起，重跑就意味着已经执行过的工具会被再执行一遍、事件会被重复发一遍。
+所以把"会挂起"的部分拆成审批节点，它只做纯计算（分级判断）；工具节点永远不挂起，
+也就永远不会重跑。
 """
 
 from __future__ import annotations
@@ -10,12 +15,15 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langgraph.types import interrupt
 
 from ..core.events import EventType
 from ..core.prompt import CODE_SYSTEM_PROMPT
 from ..core.reliability import EventEmitter
+from ..store import repo
+from ..store.db import Database
 from ..tools.base import ToolContext
-from ..tools.policy import Decision, Policy
+from ..tools.policy import Decision, Policy, PolicyDecision
 from ..tools.registry import ToolRegistry
 from .state import AgentState
 
@@ -63,53 +71,132 @@ def build_model_node(
     return call_model
 
 
+def build_approval_node(registry: ToolRegistry, policy: Policy) -> Any:
+    """审批节点：把本批需要人工确认的调用一次性挂起，等恢复。
+
+    **这个节点必须保持没有副作用**——它会被 `interrupt()` 挂起，恢复时从头重跑。
+    所以这里只做分级判断，一个事件都不发；`approval.required` 事件由 bridge 发，
+    因为 bridge 能看到挂起的原因，而且它在图外面，不会重跑。
+
+    恢复值支持两种形状：`True/False`（整批一个答案）或 `{call_id: bool}`（逐个答复）。
+    """
+
+    async def approve(state: AgentState) -> dict[str, Any]:
+        last = state["messages"][-1]
+        pending: list[dict[str, Any]] = []
+        for call in getattr(last, "tool_calls", None) or []:
+            name = str(call.get("name", ""))
+            tool = registry.get(name)
+            if tool is None:
+                continue  # 未知工具交给工具节点回填"未知工具"，不需要审批
+            decision = policy.classify(tool, dict(call.get("args") or {}))
+            if decision.decision is Decision.APPROVAL:
+                pending.append(
+                    {
+                        "call_id": str(call.get("id", "")),
+                        "name": name,
+                        "args": dict(call.get("args") or {}),
+                        "reason": decision.reason,
+                    }
+                )
+
+        if not pending:
+            return {"approvals": {}}
+
+        granted = interrupt({"requests": pending})
+        return {"approvals": _normalize_approvals(pending, granted)}
+
+    return approve
+
+
+def _normalize_approvals(pending: list[dict[str, Any]], granted: Any) -> dict[str, bool]:
+    """把恢复值规整成 `{call_id: bool}`。
+
+    无法识别的形状一律当拒绝：审批这种地方，默认值必须是"不放行"。
+    """
+    if isinstance(granted, bool):
+        return {item["call_id"]: granted for item in pending}
+    if isinstance(granted, dict):
+        return {item["call_id"]: bool(granted.get(item["call_id"], False)) for item in pending}
+    return {item["call_id"]: False for item in pending}
+
+
 def build_tool_node(
     *,
     registry: ToolRegistry,
     policy: Policy,
     ctx: ToolContext,
     emitter: EventEmitter,
+    db: Database | None = None,
 ) -> Any:
-    """工具节点：分级 → 执行或拒绝 → 发事件 → 把结果回填给模型。"""
+    """工具节点：分级 → 执行或拒绝 → 发事件 → 把结果回填给模型。
+
+    传入 `db` 时，每次调用会往 `tool_calls` 表记一条审计：
+    **全量输出入库，模型只看到截断版**——人要排查时能看全文。
+    """
 
     async def call_tools(state: AgentState) -> dict[str, Any]:
         last = state["messages"][-1]
+        approvals = state.get("approvals") or {}
+        turn_id = state.get("turn_id") or None
         results: list[AnyMessage] = []
 
         for call in getattr(last, "tool_calls", None) or []:
             name = str(call.get("name", ""))
             args = dict(call.get("args") or {})
             call_id = str(call.get("id", ""))
-            emitter.emit(EventType.TOOL_CALL, {"call_id": call_id, "name": name, "args": args})
+            await emitter.emit(
+                EventType.TOOL_CALL, {"call_id": call_id, "name": name, "args": args}
+            )
 
             tool = registry.get(name)
             if tool is None:
                 content = f"未知工具：{name}"
                 results.append(ToolMessage(content=content, tool_call_id=call_id))
-                emitter.emit(
+                await emitter.emit(
                     EventType.TOOL_RESULT,
                     {"call_id": call_id, "name": name, "status": "unknown_tool"},
                 )
                 continue
 
             decision = policy.classify(tool, args)
-            if decision.decision is not Decision.AUTO:
-                content = f"未执行（{decision.decision.value}）：{decision.reason}"
-                results.append(ToolMessage(content=content, tool_call_id=call_id))
-                emitter.emit(
+            recorded = db is not None and turn_id is not None
+            if recorded:
+                await repo.start_tool_call(
+                    db,
+                    call_id=call_id,
+                    session_id=emitter.session_id,
+                    turn_id=turn_id,
+                    name=name,
+                    args=args,
+                    tier=tool.tier.value,
+                )
+
+            # 拒绝与"未获批准"都走同一条路：不执行，把原因回填给模型
+            refusal = _refusal_reason(decision, bool(approvals.get(call_id)))
+            if refusal is not None:
+                results.append(ToolMessage(content=refusal, tool_call_id=call_id))
+                await emitter.emit(
                     EventType.TOOL_RESULT,
                     {
                         "call_id": call_id,
                         "name": name,
                         "status": decision.decision.value,
-                        "preview": content,
+                        "preview": refusal,
                     },
                 )
+                if recorded:
+                    await repo.finish_tool_call(
+                        db,
+                        call_id,
+                        status=decision.decision.value,
+                        decision=decision.decision.value,
+                    )
                 continue
 
             result = await tool.run(args, ctx)
             results.append(ToolMessage(content=result.content, tool_call_id=call_id))
-            emitter.emit(
+            await emitter.emit(
                 EventType.TOOL_RESULT,
                 {
                     "call_id": call_id,
@@ -121,7 +208,34 @@ def build_tool_node(
                     "preview": result.content[:400],
                 },
             )
+            if recorded:
+                await repo.finish_tool_call(
+                    db,
+                    call_id,
+                    status="ok" if result.ok else "error",
+                    decision="auto",
+                    result=result.content,  # 全量入库；模型只看到截断版
+                    exit_code=result.exit_code,
+                )
 
-        return {"messages": results, "tool_rounds": (state.get("tool_rounds") or 0) + 1}
+        return {
+            "messages": results,
+            "tool_rounds": (state.get("tool_rounds") or 0) + 1,
+            "approvals": {},  # 本批用完了，清空，别影响下一批
+        }
 
     return call_tools
+
+
+def _refusal_reason(decision: PolicyDecision, approved: bool) -> str | None:
+    """不执行时返回要回填给模型的文本；该执行则返回 None。
+
+    三种不执行的情况合并在这里：危险拒绝、需要审批但没批、审批超时（bridge 会
+    把超时折成"未批准"，所以到这儿看不出区别——这也是我们想要的：对模型而言
+    都是"这条路走不通，换个做法"）。
+    """
+    if decision.decision is Decision.DENY:
+        return f"未执行（拒绝）：{decision.reason}"
+    if decision.decision is Decision.APPROVAL and not approved:
+        return f"未执行（人工未批准）：{decision.reason}"
+    return None

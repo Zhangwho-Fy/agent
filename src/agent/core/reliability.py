@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .bus import EventBus
@@ -22,13 +22,25 @@ logger = logging.getLogger(__name__)
 class EventEmitter:
     """给事件分配会话内单调递增的 seq，推送到总线。
 
-    阶段 2 会在这里插入"先落库、再推送"，调用方无需改动。
+    **顺序不能反**：先推后存的话，会出现"客户端看到过、事后去库里查不到"。
+    落库通过 `sink` 注入（阶段 2 起由 `store.repo.append_event` 提供），
+    这样 core 层不用知道数据库的存在，测试里也能换成内存实现。
+
+    事件是 IO（要落库），所以 `emit` 是 async 的。
     """
 
-    def __init__(self, session_id: str, bus: EventBus, *, start_seq: int = 0) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        bus: EventBus,
+        *,
+        start_seq: int = 0,
+        sink: Callable[[Event], Awaitable[None]] | None = None,
+    ) -> None:
         self.session_id = session_id
         self._bus = bus
         self._seq = start_seq
+        self._sink = sink
         #: 进程内消费者（例如 CLI 渲染、结构化日志），SSE 消费者走 bus
         self.on_event: Callable[[Event], None] | None = None
 
@@ -36,7 +48,7 @@ class EventEmitter:
     def last_seq(self) -> int:
         return self._seq
 
-    def emit(
+    async def emit(
         self,
         type: EventType,
         data: dict[str, Any] | None = None,
@@ -51,6 +63,9 @@ class EventEmitter:
             data=data,
             turn_id=turn_id,
         )
+        if self._sink is not None:
+            # 先落库：它是事实源，落不下去就别对外宣称发生过
+            await self._sink(event)
         self._bus.publish(event)
         if self.on_event is not None:
             self.on_event(event)
