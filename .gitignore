@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+# 不带斜杠：软链接形式的 .venv 也要匹配
+.venv
+venv/
+
+# 密钥与本地配置
+.env
+.env.*
+!.env.example
+
+# 运行产物
+*.db
+*.db-journal
+*.sqlite3
+data/
+traces/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+
+# 练习目录
+Langchain_Trainning/
+
+# 本地文档（不发布到远端）
+docs/
