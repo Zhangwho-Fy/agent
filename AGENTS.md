@@ -17,9 +17,10 @@
 | 阶段 1（最小闭环） | ✅ 代码完成，**4/4 条验收已验证** |
 | 阶段 2（可靠性层） | ✅ 完成，**验收已跑通**（见"已实测"③④⑤） |
 | 阶段 3（工程化） | ✅ 完成：录放 + golden 集 + CI |
-| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行（`tests/unit/test_approval.py` 钉住）；⑥ **golden 集**：3/3 通过，**3 秒跑完、不联网、不要密钥**；⑦ 110 个测试在 `AGENT_API_KEY` 为空时同样全绿（CI 场景） |
-| 下一步 | 阶段 4：服务化（HTTP + SSE + 协议冻结）；交互式 `agent chat` 也放在这里 |
-| 代码量 | 源码约 3000 行，测试 110 个（全绿），ruff 干净 |
+| 阶段 4（服务化） | ✅ 代码完成：`agent serve`（HTTP + SSE）、`agent chat`（交互式）、断线续传、幂等接线。socket 级 `curl` 验收待在有网络的机器上跑（见 7.2） |
+| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行；⑥ **golden 集**：3/3 通过，**3 秒、不联网、不要密钥**；⑦ 全部测试在 `AGENT_API_KEY` 为空时同样全绿（CI 场景）；⑧ **服务端**：14 个测试覆盖阶段 4 三条验收，全走 ASGI 直连 + 回放 |
+| 下一步 | 阶段 5：检索（RAG）。**开工前要先定嵌入模型**（DeepSeek 没有 embeddings 接口） |
+| 代码量 | 源码约 3600 行，测试 125 个（全绿），ruff 干净 |
 | 语言 | **纯 Python，没有任何 C++ 代码**（C++ 是阶段 6 的可选加分项，见第 5 节第 6 条） |
 
 已跑通的实际效果：
@@ -64,6 +65,8 @@ rm -f uv.lock && uv sync --default-index https://mirrors.aliyun.com/pypi/simple/
 | `.venv/bin/agent run -s <会话> "任务"` | 接着已有会话跑（checkpointer 会带上历史） |
 | `.venv/bin/agent sessions` | 列出最近的会话 |
 | `.venv/bin/agent replay <会话> [--raw]` | 按原序重放事件流，**不调模型**（`--raw` 看逐条分片） |
+| `.venv/bin/agent serve` | 启动 HTTP + SSE 服务端（会打印访问令牌） |
+| `.venv/bin/agent chat [-s 会话]` | 交互式多轮对话，走服务端 |
 | `AGENT_TRACE_PATH=x.jsonl agent run ...` | 边跑边把模型调用录成夹具（阶段 3） |
 | `AGENT_PROVIDER=replay AGENT_TRACE_PATH=x.jsonl agent run ...` | 用录制文件离线跑，不联网 |
 | `.venv/bin/python -m pytest tests/eval -s` | 跑 golden 集并打印通过率（不联网、不要密钥） |
@@ -95,6 +98,9 @@ src/agent/
 │   ├── factory.py      构建模型；按 provider 决定「真实 / 边跑边录 / 回放」
 │   └── trace.py        录放：JSONL 录制器与回放器（阶段 3）
 ├── eval.py             golden 评测集：加载用例、跑回放、判定、算通过率
+├── server/             服务端（阶段 4）
+│   ├── app.py          FastAPI 路由：会话、消息、SSE 事件流、审批
+│   └── runtime.py      每会话一套：模型、图、事件发射器、审批等待区
 ├── tools/
 │   ├── base.py         ToolContext/ToolResult、工作区路径边界、输出截断
 │   ├── fs.py           fs_read / fs_list
@@ -164,13 +170,38 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/xxx.jsonl .venv/bin/agen
 .venv/bin/python -m pytest tests/eval -s
 ```
 
-### 7.2 下一步：阶段 4
+### 7.2 阶段 4 做了什么（已完成）
 
-1. `agent serve`：FastAPI + SSE，让 CLI 从"直接驱动图"改成"订阅事件流"
-2. 断线续传：`Last-Event-ID` → `repo.list_events(after_seq=...)`（存储层已就绪，缺接线）
-3. 幂等：客户端重发同一条消息时用 `idempotency` 表挡住（表和读写函数已就绪，缺接线）
-4. 交互式 CLI（`agent chat`）：一次启动多轮对话，把启动开销从"每轮都付"降到"只付一次"
-5. 协议冻结 → `docs/protocol.md`
+| # | 事项 | 落点 |
+| --- | --- | --- |
+| 1 | HTTP + SSE 服务端 | `server/app.py`（`create_app`）、`server/runtime.py`（每会话一套模型/图/审批等待区） |
+| 2 | 交互式 CLI | `agent chat`：一次启动多轮对话，走服务端；`agent serve` 启动服务端 |
+| 3 | 断线续传 | SSE 的 `Last-Event-ID` / `?after_seq=` → `repo.list_events(after_seq=...)`；**先订阅再补历史**，靠 seq 去重 |
+| 4 | 幂等 | `idempotency` 表接线：同一个键第二次直接返回原 `turn_id`，不重复执行工具 |
+| 5 | 验收 | `tests/unit/test_server.py`（14 个）：建会话→发消息→收事件→审批→结果；按 seq 补齐不丢不重；同键不重复执行 |
+
+**一个环境限制**：httpx 的 `ASGITransport` 会把响应**缓冲到结束**才交给客户端，
+所以无限 SSE 读不出实时性，测试改成"发消息 + 轮询库里的事件"，实时流那段直接
+驱动 `event_stream()` 生成器。**socket 级的 `curl` 验收要在有网络的机器上跑**：
+
+```bash
+agent serve &                       # 记下打印出来的令牌
+curl -s localhost:8765/health
+SID=$(curl -s -X POST localhost:8765/sessions -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST localhost:8765/sessions/$SID/messages -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' -d '{"content":"用一句话说明这个项目"}'
+curl -N localhost:8765/sessions/$SID/events -H "Authorization: Bearer $TOKEN"   # 实时流
+curl -s "localhost:8765/sessions/$SID/events?follow=false" -H "Authorization: Bearer $TOKEN"  # 只回放
+```
+
+### 7.3 下一步：阶段 5
+
+1. **先定嵌入模型**：DeepSeek 没有 embeddings 接口，只有两条路——本地 `bge-m3`
+   （免费离线，要下几百 MB 权重）或别家 API（通义 / 硅基流动，OpenAI 兼容）
+2. 切块 + 索引构建与增量更新（用 LangChain 的 splitter，但检索指标自己写）
+3. 混合检索（词法层可直接用 SQLite FTS5，语义层用向量）
+4. golden 集扩一档：检索类用例 + recall@5 / MRR 的实测对比写进 README
 
 ## 8. 已知坑（现象 → 原因 → 做法）
 
@@ -189,6 +220,7 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/xxx.jsonl .venv/bin/agen
 | 一接 checkpointer 就卡死 | 官方 `AsyncSqliteSaver` 基于 `aiosqlite`，而 aiosqlite 用后台线程 + 事件循环回调，撞上的是同一条限制 | 用同步 `SqliteSaver`（它的逻辑本来就在当前线程），只补一层把异步方法接到同步实现的薄适配：`graph/checkpointer.py` |
 | 审批通过后工具被执行了两遍 / 事件重复推送 | `interrupt()` 挂起的节点，**恢复时会从头重跑**。挂起点和副作用放在同一个节点里，重跑就会重复执行、重复发事件 | 把"会挂起"的部分拆成独立的**纯计算**节点（本项目是 `approve`）：它只做分级判断，一个事件都不发；执行留在永远不会挂起的 `tools` 节点。`tests/unit/test_approval.py` 钉住 |
 | 录一遍再放一遍，结果对不上 | 评测夹具用了**会变的目录**：录制文件写在被 `fs_list` 的工作区里，第二次跑时文件大小变了，工具输出自然不同 | 夹具工作区要独立且稳定（`evals/workspaces/<id>/`），录制文件、临时文件一律放工作区**外面**。`tests/unit/test_trace.py` 的注释里记着这条 |
+| 带鉴权的接口全部挂住，`/health` 却正常 | FastAPI 把**同步**依赖（`def`）丢进线程池执行，撞上"线程池任务交接失败"那条限制——同一个根因第三次踩（前两次：LangGraph 同步可调用对象、`asyncio.to_thread`） | 框架会把可调用对象丢线程池的地方，一律写成 `async def`：FastAPI 依赖、LangGraph 节点与条件边、路由函数。`server/app.py` 的 `require_token` 有注释 |
 | 本地测试全绿，CI 一上来全挂：读不到评测夹具 | `.gitignore` 里的 `traces/`（本意是忽略运行产物）把 `evals/traces/` 一起吞了，文件只存在本机、没进仓库；而 **CI 机器上只有仓库里的东西** | 夹具目录改名成 `evals/recordings/` 避开这条规则，`.gitignore` 里也留了警告；另加 `test_fixtures_are_tracked_by_git`，用 `git ls-files` 在本地就把"没提交"揪出来 |
 | 每次运行要等 30 秒以上，且前 30 秒屏幕上没有任何输出 | 代码和 `.venv` 都在 Windows 盘（`/mnt/g`，9p 挂载）。`agent run` 要读 3885 个 `.py` 文件，跨文件系统每次读都是往返。实测：`import openai` 从 `/mnt/g` 要 12.8s，从 Linux 侧只要 1.6s | `.venv` 移到 Linux 文件系统，原位置留软链接（`.gitignore` 里的规则写成 `.venv` 不带斜杠，否则软链接匹配不到）。`agent version` 从十几秒降到 1 秒 |
 

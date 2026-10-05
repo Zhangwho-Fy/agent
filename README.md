@@ -12,6 +12,7 @@
 - **崩溃恢复**：跑到一半 `kill -9`，重启后把没跑完的 turn 标成 `interrupted`，同一会话可以接着聊
 - **可重放**：`agent replay` 不调模型，把一次会话的事件流按 seq 原序还原
 - **可评测**：golden 集走回放执行，**不联网、不要密钥、几秒出通过率**
+- **服务化**：`agent serve` 提供 HTTP + SSE（任务在服务端跑，客户端只是订阅者），断线重连按 `Last-Event-ID` 补齐；`agent chat` 是配套的交互式 CLI
 - **CI**：每次 push 自动跑 ruff + pytest，全程不注入密钥
 
 ## 快速开始
@@ -29,6 +30,10 @@ uv run agent doctor         # 体检：Python、依赖、配置、密钥
 uv run agent run "用一句话说明 src/agent/graph/builder.py 里的图是怎么流转的"
 # 接着刚才那个会话继续问（checkpointer 会把历史带回来）
 uv run agent run -s <会话 id> "那个文件的异常处理是怎么做的？"
+
+# 交互式：一个终端跑服务端，另一个终端聊天
+uv run agent serve                 # 打印访问令牌
+uv run agent chat --token <令牌>    # 多轮对话，写操作会停下来问你
 ```
 
 ## 命令
@@ -41,6 +46,8 @@ uv run agent run -s <会话 id> "那个文件的异常处理是怎么做的？"
 | `agent run -w <目录> "任务"` | 换个工作区 |
 | `agent sessions` | 列出最近的会话 |
 | `agent replay <会话> [--raw]` | 重放事件流，**不调模型** |
+| `agent serve` | 启动 HTTP + SSE 服务端 |
+| `agent chat [-s 会话] [--token ...]` | 交互式多轮对话（走服务端） |
 | `agent doctor` / `agent config` / `agent version` | 环境与配置自检（不依赖 langgraph） |
 
 ## 开发
@@ -67,7 +74,8 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 | 0 设计 / 1 最小闭环 | ✅ |
 | 2 可靠性层（持久化、幂等、崩溃恢复、审批、checkpointer） | ✅ 验收已跑通 |
 | 3 工程化（录放、golden 集、CI） | ✅ |
-| 4 服务化（HTTP + SSE + 协议冻结） | 下一步 |
+| 4 服务化（HTTP + SSE、断线续传、幂等、交互式 CLI） | ✅ |
+| 5 检索（RAG：切块、混合检索、recall@5 评测） | 下一步 |
 
 编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。详细进度与踩过的坑见 [AGENTS.md](AGENTS.md)。
 
