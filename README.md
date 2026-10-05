@@ -1,24 +1,22 @@
 # agent
 
-一个本地运行的代码库助手 Agent：在指定仓库里读代码、跑命令、改文件，闭环完成真实任务；兼有纯聊天模式。
+一个本地运行的代码库助手 Agent：在指定仓库里读代码、跑命令、改文件，闭环完成真实任务。
 
 设计目标不是"能调模型"，而是把模型外面那圈工程做扎实：**可持久化、可恢复、可重放、可评测**。
 
-## 文档
+## 现在能做什么
 
-- [AGENTS.md](AGENTS.md) — **交接文档**：当前状态、换机器继续的步骤、代码地图、设计决定、已知坑
-- [docs/design.md](docs/design.md) — 目标、非目标、里程碑、验收标准
-- [docs/detailed-design.md](docs/detailed-design.md) — 选型、架构、目录结构、接口、数据模型、配置、测试策略
-- [docs/stage-1.md](docs/stage-1.md) — 阶段 1 总结：做成了什么、一次 run 的完整流程、为什么 agent 需要"图"
-- [docs/knowledge.md](docs/knowledge.md) — 知识点与面试考点（面试前只读这一份）
-- [docs/protocol.md](docs/protocol.md) — 事件与 HTTP 协议契约（第 4 阶段冻结）
-
-## 当前状态
-
-阶段 0（设计与骨架）与阶段 1（最小闭环）已完成：`agent run` 能真实读代码、跑命令、流式回答。
-阶段 2（可靠性层：SQLite 持久化、幂等、崩溃恢复、checkpointer）是下一步，进度见 [AGENTS.md](AGENTS.md) 第 1 节。
+- **真读真跑**：三个工具（`fs_read` / `fs_list` / `shell_exec`），模型自己决定调哪个、调几次，结果回填后继续推理
+- **分级管控**：只读命令自动执行；有副作用的命令挂起等你点头；危险命令（`rm -rf`、`sudo`、`git push`…）直接拒绝，并把原因回填给模型让它换做法
+- **会话持久化**：事件、消息、工具调用、审批、token 用量全部落 SQLite
+- **崩溃恢复**：跑到一半 `kill -9`，重启后把没跑完的 turn 标成 `interrupted`，同一会话可以接着聊
+- **可重放**：`agent replay` 不调模型，把一次会话的事件流按 seq 原序还原
+- **可评测**：golden 集走回放执行，**不联网、不要密钥、几秒出通过率**
+- **CI**：每次 push 自动跑 ruff + pytest，全程不注入密钥
 
 ## 快速开始
+
+需要 `uv`（含 Python 3.12 下载能力）、DeepSeek API key、网络。
 
 ```bash
 # 没有 uv 就先装：curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -26,7 +24,56 @@ uv sync                     # 建 .venv；国内网络慢时加 UV_HTTP_TIMEOUT=
                             # 系统只有 3.13/3.14 时用 uv sync --python 3.12
 cp .env.example .env        # 填入 AGENT_API_KEY，该文件不进 git
 uv run agent doctor         # 体检：Python、依赖、配置、密钥
+
+# 跑一个真实任务
 uv run agent run "用一句话说明 src/agent/graph/builder.py 里的图是怎么流转的"
+# 接着刚才那个会话继续问（checkpointer 会把历史带回来）
+uv run agent run -s <会话 id> "那个文件的异常处理是怎么做的？"
 ```
 
-当前只有单进程 CLI（`run` / `doctor` / `config` / `version`）。`agent serve`（HTTP + SSE 服务端）属于阶段 4，尚未实现。
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `agent run "任务"` | 跑一轮任务，终端流式显示 |
+| `agent run -s <会话> "任务"` | 接着已有会话跑 |
+| `agent run -y "任务"` | 自动批准所有写操作（无人值守） |
+| `agent run -w <目录> "任务"` | 换个工作区 |
+| `agent sessions` | 列出最近的会话 |
+| `agent replay <会话> [--raw]` | 重放事件流，**不调模型** |
+| `agent doctor` / `agent config` / `agent version` | 环境与配置自检（不依赖 langgraph） |
+
+## 开发
+
+```bash
+uv run pytest -q                       # 全部测试：不需要联网、不需要密钥
+uv run pytest tests/eval -s            # golden 集，打印通过率
+uv run ruff check . && uv run ruff format --check .
+```
+
+**录放**是这套测试的地基：把真实模型调用录成 JSONL，之后离线回放，测试因此既快又确定。
+
+```bash
+# 录：真实调用，同时把每次 (请求, 响应) 追加进文件
+AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run agent run "任务"
+# 放：完全离线
+AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run agent run "任务"
+```
+
+## 状态
+
+| 阶段 | 状态 |
+| --- | --- |
+| 0 设计 / 1 最小闭环 | ✅ |
+| 2 可靠性层（持久化、幂等、崩溃恢复、审批、checkpointer） | ✅ 验收已跑通 |
+| 3 工程化（录放、golden 集、CI） | ✅ |
+| 4 服务化（HTTP + SSE + 协议冻结） | 下一步 |
+
+编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。详细进度与踩过的坑见 [AGENTS.md](AGENTS.md)。
+
+## 文档
+
+- [AGENTS.md](AGENTS.md) — **交接文档**：当前状态、换机器继续的步骤、代码地图、设计决定、已知坑
+
+> 更细的设计文档（`docs/design.md`、`docs/detailed-design.md`、`docs/stage-1.md`、`docs/knowledge.md`）
+> 是**本地文档**，已从版本控制移除，克隆这个仓库不会有它们。
