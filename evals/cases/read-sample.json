@@ -2,7 +2,7 @@
   "id": "read-sample",
   "prompt": "sample.py 里定义了哪几个函数？只列函数名。",
   "workspace": "evals/workspaces/read-sample",
-  "trace": "evals/traces/read-sample.jsonl",
+  "trace": "evals/recordings/read-sample.jsonl",
   "checks": [
     { "kind": "answer_nonempty" },
     { "kind": "answer_contains", "text": "add" },

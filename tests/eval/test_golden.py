@@ -1,6 +1,6 @@
 """golden 评测集：跑回放，给出通过率。
 
-**不需要联网、不需要密钥**——模型响应全部来自 `evals/traces/*.jsonl`。
+**不需要联网、不需要密钥**——模型响应全部来自 `evals/recordings/*.jsonl`。
 所以它既能在本地随手跑，也能直接放进 CI。
 
 改了提示词、图结构、工具清单之后，这里会告诉你"整体是变好还是变坏"；
@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -29,3 +31,26 @@ async def test_golden_set_passes() -> None:
     print("\n" + report.as_text())
 
     assert report.failed == 0, "有 golden 用例没通过：\n" + report.as_text()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="没有 git，跳过仓库检查")
+def test_fixtures_are_tracked_by_git() -> None:
+    """夹具必须真的在仓库里，而不只是在本机磁盘上。
+
+    踩过的坑：`evals/traces/` 被 `.gitignore` 里那条 `traces/`（本意是忽略运行产物）
+    一起吞掉了——本地跑全绿，CI 一上来三条全挂，因为 CI 机器上**只有仓库里的东西**。
+    这条测试把"你以为提交了"变成"当场就知道"。（该目录现已改名 `recordings/`。）
+    """
+    for case in load_cases(CASES_DIR):
+        relative = case.trace if not case.trace.is_absolute() else case.trace.relative_to(REPO_ROOT)
+        assert (REPO_ROOT / relative).exists(), f"夹具不存在：{relative}"
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(relative)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+        assert tracked.returncode == 0, (
+            f"夹具没有被 git 跟踪，CI 上会读不到：{relative}"
+            "（检查它是不是撞上了 .gitignore 的规则）"
+        )

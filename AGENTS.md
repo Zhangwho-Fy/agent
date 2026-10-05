@@ -149,7 +149,7 @@ evals/                  golden 用例（cases/）、夹具工作区（workspaces
 | # | 事项 | 落点 |
 | --- | --- | --- |
 | 1 | 录放 | `models/trace.py`（`RecordingChatModel` / `ReplayChatModel` / JSONL 读写），`models/factory.py` 按 provider 分流 |
-| 2 | golden 集 | `eval.py`（加载用例 + 判定 + 通过率）、`evals/cases/*.json`、`evals/workspaces/`、`evals/traces/*.jsonl` |
+| 2 | golden 集 | `eval.py`（加载用例 + 判定 + 通过率）、`evals/cases/*.json`、`evals/workspaces/`、`evals/recordings/*.jsonl` |
 | 3 | CI | `.github/workflows/ci.yml`：`uv sync --frozen` → ruff → pytest，**不注入任何密钥** |
 | 4 | 验收 | golden 3/3；110 个测试在空密钥下全绿 |
 
@@ -157,9 +157,9 @@ evals/                  golden 用例（cases/）、夹具工作区（workspaces
 
 ```bash
 # 录：真实调用，同时把每次 (请求, 响应) 追加到 JSONL
-AGENT_TRACE_PATH=evals/traces/xxx.jsonl .venv/bin/agent run "任务"
+AGENT_TRACE_PATH=evals/recordings/xxx.jsonl .venv/bin/agent run "任务"
 # 放：完全离线，不联网不要密钥
-AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/traces/xxx.jsonl .venv/bin/agent run "任务"
+AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/xxx.jsonl .venv/bin/agent run "任务"
 # 评测：跑 golden 集并打印通过率
 .venv/bin/python -m pytest tests/eval -s
 ```
@@ -189,6 +189,7 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/traces/xxx.jsonl .venv/bin/agent ru
 | 一接 checkpointer 就卡死 | 官方 `AsyncSqliteSaver` 基于 `aiosqlite`，而 aiosqlite 用后台线程 + 事件循环回调，撞上的是同一条限制 | 用同步 `SqliteSaver`（它的逻辑本来就在当前线程），只补一层把异步方法接到同步实现的薄适配：`graph/checkpointer.py` |
 | 审批通过后工具被执行了两遍 / 事件重复推送 | `interrupt()` 挂起的节点，**恢复时会从头重跑**。挂起点和副作用放在同一个节点里，重跑就会重复执行、重复发事件 | 把"会挂起"的部分拆成独立的**纯计算**节点（本项目是 `approve`）：它只做分级判断，一个事件都不发；执行留在永远不会挂起的 `tools` 节点。`tests/unit/test_approval.py` 钉住 |
 | 录一遍再放一遍，结果对不上 | 评测夹具用了**会变的目录**：录制文件写在被 `fs_list` 的工作区里，第二次跑时文件大小变了，工具输出自然不同 | 夹具工作区要独立且稳定（`evals/workspaces/<id>/`），录制文件、临时文件一律放工作区**外面**。`tests/unit/test_trace.py` 的注释里记着这条 |
+| 本地测试全绿，CI 一上来全挂：读不到评测夹具 | `.gitignore` 里的 `traces/`（本意是忽略运行产物）把 `evals/traces/` 一起吞了，文件只存在本机、没进仓库；而 **CI 机器上只有仓库里的东西** | 夹具目录改名成 `evals/recordings/` 避开这条规则，`.gitignore` 里也留了警告；另加 `test_fixtures_are_tracked_by_git`，用 `git ls-files` 在本地就把"没提交"揪出来 |
 | 每次运行要等 30 秒以上，且前 30 秒屏幕上没有任何输出 | 代码和 `.venv` 都在 Windows 盘（`/mnt/g`，9p 挂载）。`agent run` 要读 3885 个 `.py` 文件，跨文件系统每次读都是往返。实测：`import openai` 从 `/mnt/g` 要 12.8s，从 Linux 侧只要 1.6s | `.venv` 移到 Linux 文件系统，原位置留软链接（`.gitignore` 里的规则写成 `.venv` 不带斜杠，否则软链接匹配不到）。`agent version` 从十几秒降到 1 秒 |
 
 ## 9. 协作约定
