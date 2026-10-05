@@ -15,9 +15,10 @@
 | --- | --- |
 | 阶段 0（设计） | ✅ 完成 |
 | 阶段 1（最小闭环） | ✅ 代码完成，**4/4 条验收已验证** |
-| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件 |
-| 下一步 | 阶段 2：可靠性层（SQLite 持久化、幂等、崩溃恢复、checkpointer） |
-| 代码量 | 源码约 1700 行，测试 78 个（全绿），ruff 干净 |
+| 阶段 2（可靠性层） | ✅ 完成，**验收已跑通**（见"已实测"③④⑤） |
+| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行（`tests/unit/test_approval.py` 钉住） |
+| 下一步 | 阶段 3：录放、golden 评测集、CI |
+| 代码量 | 源码约 2700 行，测试 104 个（全绿），ruff 干净 |
 | 语言 | **纯 Python，没有任何 C++ 代码**（C++ 是阶段 6 的可选加分项，见第 5 节第 6 条） |
 
 已跑通的实际效果：
@@ -59,6 +60,9 @@ rm -f uv.lock && uv sync --default-index https://mirrors.aliyun.com/pypi/simple/
 | `.venv/bin/agent doctor` | 环境与配置体检（不依赖 langgraph，缺依赖也能跑） |
 | `.venv/bin/agent config` | 打印解析后的配置（密钥只显示长度） |
 | `.venv/bin/agent run "任务"` | 跑一次真实任务，终端流式显示 |
+| `.venv/bin/agent run -s <会话> "任务"` | 接着已有会话跑（checkpointer 会带上历史） |
+| `.venv/bin/agent sessions` | 列出最近的会话 |
+| `.venv/bin/agent replay <会话> [--raw]` | 按原序重放事件流，**不调模型**（`--raw` 看逐条分片） |
 | `.venv/bin/python -m pytest -q` | 全量测试（**不需要联网、不需要 key**） |
 | `.venv/bin/ruff check . && .venv/bin/ruff format --check .` | 静态检查，提交前必须过 |
 | `.venv/bin/python scripts/smoke_api.py` | 模型连通性烟测（真实调用，手动跑） |
@@ -71,9 +75,10 @@ src/agent/
 ├── logging.py          结构化日志（一行一 JSON），压掉 httpx 之类噪音
 ├── graph/              编排（LangGraph）
 │   ├── state.py        图状态；messages 用 add_messages 归约器
-│   ├── nodes.py        模型节点 + 工具节点（分级/拦截/发事件都在工具节点里）
-│   ├── builder.py      组装 START → agent ⇄ tools → END
-│   └── bridge.py       把框架的流翻译成我们的事件（关键适配层）
+│   ├── nodes.py        模型节点 + 审批节点 + 工具节点
+│   ├── builder.py      组装 START → agent ⇄ approve → tools → agent
+│   ├── checkpointer.py 检查点存储（同步 SqliteSaver + 异步薄适配）
+│   └── bridge.py       把框架的流翻译成我们的事件（关键适配层，含审批等待）
 ├── core/
 │   ├── events.py       事件模型 + SSE 编码（seq 作 SSE id，供断线续传）
 │   ├── bus.py          会话内事件分发（有界队列，慢了丢最老）
@@ -89,6 +94,10 @@ src/agent/
 │   ├── shell.py        shell_exec（超时杀进程组、环境变量白名单）
 │   ├── policy.py       三级分级：只读自动 / 写操作审批 / 危险拒绝
 │   └── registry.py     工具注册与 schema 导出
+├── store/              持久化：SQLite 里的事实源（阶段 2）
+│   ├── schema.sql      六张表的建表语句（events 是事实源，messages 是投影）
+│   ├── db.py           Database：连接、WAL、串行化访问
+│   └── repo.py         各表读写：seq 分配、按 seq 补事件、崩溃恢复标记……
 └── client/main.py      CLI：run / doctor / config / version
 ```
 
@@ -111,14 +120,26 @@ src/agent/
 | [docs/knowledge.md](docs/knowledge.md) | 知识点与面试考点（面试前只读这一份） |
 | [docs/protocol.md](docs/protocol.md) | 事件与 HTTP 契约（阶段 4 冻结，暂未创建） |
 
-## 7. 阶段 2 要做什么（下一步）
+> 注意：`docs/` 是**本地文档**，已从版本控制移除（`.gitignore` 里忽略），
+> 只存在于开发机上。上面的链接在本机可用，克隆到别处则没有这些文件。
 
-1. 建 SQLite 表：`sessions` / `messages` / `events` / `turns` / `tool_calls` / `idempotency`（schema 见 detailed-design 4.1）
-2. `EventEmitter` 改成**先落库再推送**（接口不变，换实现）
-3. 接 LangGraph 的 checkpointer：依赖 `langgraph-checkpoint-sqlite` 已在 `pyproject.toml`（`uv sync` 已装好），剩下的是接线
-4. 接审批流：工具节点用 `interrupt()` 挂起，`Command(resume=...)` 恢复，**超时按拒绝**
-5. 崩溃恢复：重启后把 `running` 的 turn 标成 `interrupted`，会话历史可读、可继续
-6. 验收：跑到一半 `kill -9`，重启后会话还在、能续跑；`agent replay <trace>` 不调模型也能还原事件序列
+## 7. 阶段 2 做了什么（已完成）
+
+| # | 事项 | 落点 |
+| --- | --- | --- |
+| 1 | SQLite 六张表 + 读写函数 | `store/schema.sql`、`store/db.py`、`store/repo.py` |
+| 2 | 事件**先落库再推送** | `core/reliability.py` 的 `sink`，接口仍是 `emit()`（变成 async） |
+| 3 | LangGraph checkpointer | `graph/checkpointer.py`（`SqliteSaver` + 异步薄适配；为什么不用 `AsyncSqliteSaver` 见文件说明） |
+| 4 | 审批流 | `graph/nodes.py` 的 `approve` 节点 `interrupt()`；`graph/bridge.py` 负责等待与 `Command(resume=...)`；超时/无通道按拒绝 |
+| 5 | 崩溃恢复 | `repo.interrupt_running_turns()`，CLI 启动时调用 |
+| 6 | 验收 | `agent run` / `kill -9` / `--session` 续跑 / `agent replay` 四步已实测 |
+
+### 7.1 下一步：阶段 3
+
+1. **录放**：自定义 `BaseChatModel` 做录制与回放（录成 JSONL），目标是**不设置 API key 也能跑全流程**，CI 不需要密钥
+2. **golden 评测集**：固定任务集 + `pytest eval` 输出通过率
+3. **CI**：pytest + ruff 的绿色构建，缓存 uv 依赖
+4. 验收：`pytest` 全绿；`pytest eval` 输出通过率；不设置 key 也能跑回放
 
 ## 8. 已知坑（现象 → 原因 → 做法）
 
@@ -133,6 +154,10 @@ src/agent/
 | 循环上限配置不生效 | `AGENT_MAX_TOOL_ROUNDS` 定义了但没人读，`bridge.py` 写死 `recursion_limit=40` | 上限改成在模型节点按 `tool_rounds` 判断（到顶就不再调模型、直接收尾一句），`recursion_limit` 只当护栏，用 `recursion_limit_for()` 按"一轮 2 步"换算（已修，`tests/unit/test_graph.py` 钉住） |
 | 图跑到一半就没声音了（不像报错，也不占 CPU） | 框架会把**同步**可调用对象丢进线程池执行；受限容器里线程池的任务交接不可用，于是永久等待 | 条件边路由函数写成 `async`（图里其余部分本来就全是 async）。已验证：改完在沙箱内 8 秒跑完全量测试 |
 | 假模型/回放模型返回的消息"没被追加" | `add_messages` 归约器按 id 去重：**同一个消息对象重复返回等于没追加**（id 都是 `None` 时它按"是否已在列表里"判断），于是最后一条停在 ToolMessage，条件边直接收工 | 每次返回**新的消息对象**（`model_copy(deep=True)` 或每次新建）。阶段 3 写回放模型时必须注意 |
+| 整个进程静默卡死，不报错也不占 CPU（`asyncio.to_thread` 相关） | 受限容器里，把阻塞调用丢进线程池后，工作线程**反向唤醒事件循环**这一步会失败。判据：`to_thread` 里跑 `time.sleep` / 写文件 / 任何 sqlite 语句都挂住，换成手写 `threading.Thread` 就正常——差别只在要不要唤醒事件循环 | 别用 `to_thread` 包装阻塞调用。数据库这类"单条语句微秒级"的操作直接在事件循环里同步执行（`store/db.py` 就是这么做并写明了理由）；真要异步 IO 就找原生异步驱动 |
+| 一接 checkpointer 就卡死 | 官方 `AsyncSqliteSaver` 基于 `aiosqlite`，而 aiosqlite 用后台线程 + 事件循环回调，撞上的是同一条限制 | 用同步 `SqliteSaver`（它的逻辑本来就在当前线程），只补一层把异步方法接到同步实现的薄适配：`graph/checkpointer.py` |
+| 审批通过后工具被执行了两遍 / 事件重复推送 | `interrupt()` 挂起的节点，**恢复时会从头重跑**。挂起点和副作用放在同一个节点里，重跑就会重复执行、重复发事件 | 把"会挂起"的部分拆成独立的**纯计算**节点（本项目是 `approve`）：它只做分级判断，一个事件都不发；执行留在永远不会挂起的 `tools` 节点。`tests/unit/test_approval.py` 钉住 |
+| 每次运行要等 30 秒以上，且前 30 秒屏幕上没有任何输出 | 代码和 `.venv` 都在 Windows 盘（`/mnt/g`，9p 挂载）。`agent run` 要读 3885 个 `.py` 文件，跨文件系统每次读都是往返。实测：`import openai` 从 `/mnt/g` 要 12.8s，从 Linux 侧只要 1.6s | `.venv` 移到 Linux 文件系统，原位置留软链接（`.gitignore` 里的规则写成 `.venv` 不带斜杠，否则软链接匹配不到）。`agent version` 从十几秒降到 1 秒 |
 
 ## 9. 协作约定
 
