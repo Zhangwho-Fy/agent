@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     tool_timeout_s: float = Field(default=60.0, gt=0, description="单个工具超时（秒）")
     output_limit_bytes: int = Field(default=8192, ge=256, description="工具输出进上下文的截断阈值")
     approval_timeout_s: float = Field(default=120.0, gt=0, description="审批等待上限，超时视为拒绝")
+    context_limit: int = Field(
+        default=128_000,
+        description="模型上下文窗口（token），只用于交互式状态栏显示占用比例",
+    )
 
     # ---- 服务 ----
     host: str = "127.0.0.1"

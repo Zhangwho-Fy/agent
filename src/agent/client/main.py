@@ -20,6 +20,8 @@ import importlib.metadata
 import json
 import secrets
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -76,6 +78,71 @@ class EventRenderer:
             console.print(f"\n[yellow]需要确认[/yellow] {data.get('name')} {args}")
         elif kind == "error":
             console.print(f"\n[red]错误：{data.get('message')}[/red]")
+
+
+@dataclass
+class ChatStatus:
+    """交互式会话的状态，给底部状态栏用。
+
+    数据全部来自 `turn.done` 事件里的 `usage`——本来就是模型真实报出来的 token 数，
+    不需要额外估算。`last_input_tokens` 是最近一次调用实际塞进上下文的量，
+    所以它就是"当前上下文占用"最直接的度量。
+    """
+
+    model: str = ""
+    workspace: str = ""
+    session_id: str = ""
+    turns: int = 0
+    last_input: int = 0
+    last_output: int = 0
+    total: int = 0
+    context_limit: int = 0
+
+    def track(self, usage: dict[str, Any]) -> None:
+        self.last_input = int(usage.get("input_tokens", 0))
+        self.last_output = int(usage.get("output_tokens", 0))
+        self.total += self.last_input + self.last_output
+        self.turns += 1
+
+    def text(self) -> str:
+        short = self.session_id[-6:] if self.session_id else "-"
+        used = f"上下文 {self.last_input}"
+        if self.context_limit:
+            used += f"/{self.context_limit}（{self.last_input / self.context_limit:.0%}）"
+        return (
+            f" {self.model} │ 会话 …{short} │ {self.workspace} │ "
+            f"{used} │ 本轮 ↑{self.last_input} ↓{self.last_output} │ "
+            f"累计 {self.total} │ 第 {self.turns} 轮"
+        )
+
+
+def make_asker(status: ChatStatus) -> Callable[[], str]:
+    """返回"读一行输入"的函数。
+
+    有 `prompt_toolkit` 且确实在终端里跑，就用带底栏的输入框（输入固定在底部，
+    状态栏挂在它下面）；否则退回 `input()`——重定向、CI、管道里没有 tty，
+    底栏那一套根本渲染不出来，硬上只会输出一堆控制字符。
+
+    加依赖：`uv add prompt_toolkit`（没装也能跑，只是没有底栏）。
+    """
+    try:
+        from prompt_toolkit import PromptSession
+
+        if not sys.stdout.isatty():
+            raise RuntimeError("不在终端里")
+    except Exception:
+
+        def plain() -> str:
+            return input("\n你 > ")
+
+        return plain
+
+    session = PromptSession()
+
+    def with_toolbar() -> str:
+        return str(session.prompt("你 > ", bottom_toolbar=status.text))
+
+    return with_toolbar
 
 
 @app.callback()
@@ -540,6 +607,7 @@ async def _chat(
 
     from ..client.api import AgentClient
 
+    settings = Settings()
     renderer = EventRenderer()
     async with AgentClient(server, token) as client:
         try:
@@ -560,11 +628,18 @@ async def _chat(
             console.print(f"[dim]继续会话 {session_id}[/dim]")
         console.print("[dim]输入内容回车发送；exit / quit 退出[/dim]")
 
+        status = ChatStatus(
+            model=settings.model,
+            workspace=str(workspace) if workspace else "",
+            session_id=session_id,
+            context_limit=settings.context_limit,
+        )
+        ask = make_asker(status)
         last_seq = 0
         while True:
             try:
                 # 故意阻塞：CLI 本来就在等用户输入（换成线程池会踩 AGENTS.md 记的坑）
-                line = input("\n你 > ").strip()  # noqa: ASYNC250
+                line = ask().strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if not line:
@@ -595,6 +670,7 @@ async def _chat(
                     continue
                 renderer(event)
                 if event.type.value == "turn.done" and event.turn_id == turn_id:
+                    status.track(event.data.get("usage") or {})
                     break
         console.print("\n[dim]再见[/dim]")
     return 0
