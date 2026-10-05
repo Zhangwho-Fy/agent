@@ -87,7 +87,14 @@ class ChatStatus:
     数据全部来自 `turn.done` 事件里的 `usage`——本来就是模型真实报出来的 token 数，
     不需要额外估算。`last_input_tokens` 是最近一次调用实际塞进上下文的量，
     所以它就是"当前上下文占用"最直接的度量。
+
+    `phase` / `frame` 是给常驻底栏用的"这一刻在干什么"：空闲时为空串，
+    执行时是"思考中 / 执行 fs_read / 输出中"，`frame` 由 `_spin()` 逐帧推进，
+    底栏据此转圈。**它不进 `text()`**——行式底栏（PromptSession 那条路）不需要它。
     """
+
+    #: 点状 spinner 的帧序，纯文本、无依赖
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     model: str = ""
     workspace: str = ""
@@ -97,6 +104,8 @@ class ChatStatus:
     last_output: int = 0
     total: int = 0
     context_limit: int = 0
+    phase: str = ""
+    frame: int = 0
 
     def track(self, usage: dict[str, Any]) -> None:
         self.last_input = int(usage.get("input_tokens", 0))
@@ -105,15 +114,71 @@ class ChatStatus:
         self.turns += 1
 
     def text(self) -> str:
+        """整条状态栏的纯文本。行式底栏（`PromptSession` 的 toolbar）要的就是它。"""
+        return "".join(text for _style, text in self.segments())
+
+    def segments(self, *, aligned: bool = False) -> list[tuple[str, str]]:
+        """状态栏的分段内容（样式类, 文本）。
+
+        这里只负责"哪一段是什么"，颜色在 `TUI_STYLE` 里定；纯文本由 `text()`
+        拼出来，两条路共用同一份内容，不会各写一遍。
+
+        `aligned=True` 给全屏界面用：会变宽的字段（模型名、数字）补到固定宽度，
+        这样阶段名从"空闲"变成"执行 fs_read"、token 数进一位，整条也不会左右抖。
+        """
         short = self.session_id[-6:] if self.session_id else "-"
-        used = f"上下文 {self.last_input}"
-        if self.context_limit:
-            used += f"/{self.context_limit}（{self.last_input / self.context_limit:.0%}）"
-        return (
-            f" {self.model} │ 会话 …{short} │ {self.workspace} │ "
-            f"{used} │ 本轮 ↑{self.last_input} ↓{self.last_output} │ "
-            f"累计 {self.total} │ 第 {self.turns} 轮"
+        ratio = self.last_input / self.context_limit if self.context_limit else 0.0
+        usage = (
+            "class:bar.usage.hot"
+            if ratio >= 0.8
+            else "class:bar.usage.warn"
+            if ratio >= 0.5
+            else "class:bar.usage.ok"
         )
+
+        digits = len(str(self.context_limit)) if self.context_limit else 4
+        if aligned:
+            # 数字右对齐到固定列：不进位就不挪窝
+            history = f"本轮 ↑{self.last_input:>{digits}} ↓{self.last_output:>{digits}}"
+            total = f"累计 {self.total:>{digits + 2}}"
+            turns = f"第 {self.turns:>3} 轮"
+            model = _fit(self.model, 18)
+            session = _fit(f"…{short}", 8)
+            used = f"上下文 {self.last_input:>{digits}}"
+        else:
+            history = f"本轮 ↑{self.last_input} ↓{self.last_output}"
+            total = f"累计 {self.total}"
+            turns = f"第 {self.turns} 轮"
+            model = self.model
+            session = f"…{short}"
+            used = f"上下文 {self.last_input}"
+
+        if self.context_limit:
+            percent = f"{ratio:>4.0%}" if aligned else f"{ratio:.0%}"
+            used += f"/{self.context_limit}（{percent}）"
+
+        return [
+            ("class:bar.model", f" {model}"),
+            ("class:bar.dim", " │ 会话 "),
+            ("class:bar.session", session),
+            ("class:bar.dim", f" │ {self.workspace} │ "),
+            (usage, used),
+            ("class:bar.dim", f" │ {history} │ {total} │ {turns}"),
+        ]
+
+    def set_phase(self, phase: str) -> None:
+        """进入某个执行阶段，底栏开始转圈。"""
+        self.phase = phase
+
+    def clear_phase(self) -> None:
+        """回到空闲——但底栏本身不消失，只是不再转圈。"""
+        self.phase = ""
+
+    def tick(self) -> None:
+        self.frame += 1
+
+    def spinner(self) -> str:
+        return self.SPINNER[self.frame % len(self.SPINNER)]
 
 
 def make_plain_asker() -> Callable[[], Awaitable[str]]:
@@ -192,33 +257,211 @@ def format_event_plain(event: Any) -> str:
         return ""  # 分片已经逐字打过了
     if kind == "tool.call":
         args = json.dumps(data.get("args", {}), ensure_ascii=False)
-        return f"\n→ {data.get('name')} {args}\n"
+        return f"→ {data.get('name')} {args}\n"
     if kind == "tool.result":
         return f"  ← {data.get('status')}\n"
     if kind == "approval.required":
-        return f"\n需要确认：{data.get('name')}\n"
+        return f"需要确认：{data.get('name')}\n"
     if kind == "error":
-        return f"\n错误：{data.get('message')}\n"
+        return f"错误：{data.get('message')}\n"
     return ""
 
 
-class ChatTUI:
-    """常驻界面：日志在上、状态栏居中、输入行钉在最底。
+#: 界面配色。全部用 ANSI 名字而不是写死的 RGB——深浅两种终端配色都能看清。
+#: 只有状态栏是例外：它有固定底色（下面两行注释说明），所以颜色也写死。
+TUI_STYLE = {
+    # 状态栏：固定深色底 + 浅灰字。写死是为了不管终端深浅都成立——
+    # `reverse` 在深色终端上会翻成一条白条，又晃眼又单调。
+    "bar": "bg:#20242c #8b93a7",
+    "bar.model": "#7aa2f7 bold",  # 模型名：蓝
+    "bar.session": "#9ece6a",  # 会话号：绿
+    "bar.dim": "#565f89",  # 分隔符和次要数字：退到背景里
+    "bar.usage.ok": "#9ece6a",  # 上下文占用：绿 → 黄 → 红
+    "bar.usage.warn": "#e0af68",
+    "bar.usage.hot": "#f7768e bold",
+    "bar.busy": "#e0af68 bold",  # 执行中的阶段：黄
+    "bar.idle": "#9ece6a",  # 空闲：绿点
+    "bar.hint": "#bb9af7",  # 回滚提示：紫
+    "prompt": "#7aa2f7 bold",  # 输入提示符，跟模型名一个色系
+    "user": "bold ansibrightblue",
+    "tool": "ansibrightblack",  # Codex 那种暗灰：过程信息一律退到背景里去
+    "error": "ansired bold",
+    "code": "ansibrightblack",
+    "code.keyword": "ansibrightmagenta",
+    "code.string": "ansigreen",
+    "code.number": "ansibrightyellow",
+    "code.comment": "ansibrightblack italic",
+    "code.func": "ansicyan",
+    "code.builtin": "ansibrightcyan",
+    "code.op": "",
+}
 
-    和之前那版失败做法的根本区别：**这里没有任何东西写 stdout**。
-    日志是界面自己的缓冲区，流式 token 直接追加进去再 `invalidate()`。
-    没有 `patch_stdout`、没有 rich、没有两套渲染抢终端。
+#: 日志行的类型 → 样式类。空串表示"用终端默认前景色"。
+LINE_CLASS = {"user": "class:user", "assistant": "", "tool": "class:tool", "error": "class:error"}
+
+
+def _group_of(kind: str) -> str:
+    """把行归类，用来决定"哪里该空一行"和"哪些行能折叠到一起"。"""
+    if kind.startswith("code:"):
+        return "code"
+    return kind
+
+
+def _needs_separator(
+    items: list[tuple[str, list[tuple[str, str]]]], previous: str | None, group: str
+) -> bool:
+    """换组要空一行，但**别空两行**：正文里本来就有空行时按它自己的来。"""
+    if previous is None or previous == group:
+        return False
+    return not items or bool(items[-1][1])
+
+
+def _code_class(token: Any) -> str:
+    """pygments 的 token 类型 → 我们的样式类。"""
+    from pygments.token import Token
+
+    for base, name in (
+        (Token.Comment, "code.comment"),
+        (Token.Literal.String, "code.string"),
+        (Token.Literal.Number, "code.number"),
+        (Token.Keyword, "code.keyword"),
+        (Token.Name.Builtin, "code.builtin"),
+        (Token.Name.Function, "code.func"),
+        (Token.Name.Class, "code.func"),
+        (Token.Name.Decorator, "code.func"),
+        (Token.Operator, "code.op"),
+    ):
+        if token in base:
+            return f"class:{name}"
+    return "class:code"
+
+
+def _code_fragments(text: str, lang: str) -> list[tuple[str, str]]:
+    """给一行代码上色。
+
+    有 pygments 就用它正经分词；没有就整行一个暗灰样式——高亮是锦上添花，
+    不能因为它缺依赖就把整个界面弄挂（pygments 目前只是传递依赖，没写进
+    pyproject）。逐行分词拿不到跨行状态，三引号字符串/块注释会掉色，
+    聊天窗口里可以接受。
+    """
+    if not text:
+        return []
+    try:
+        from pygments import lex
+        from pygments.lexers import get_lexer_by_name
+    except ImportError:
+        return [("class:code", text)]
+
+    try:
+        lexer = get_lexer_by_name(lang or "text", stripnl=False)
+    except Exception:
+        return [("class:code", text)]
+
+    fragments: list[tuple[str, str]] = []
+    for token, value in lex(text, lexer):
+        fragments.append((_code_class(token), value))
+    if fragments and fragments[-1][1].endswith("\n"):  # lexer 会补一个结尾换行
+        fragments[-1] = (fragments[-1][0], fragments[-1][1][:-1])
+    return [fragment for fragment in fragments if fragment[1]] or [("class:code", text)]
+
+
+def _line_fragments(kind: str, text: str) -> list[tuple[str, str]]:
+    """一行日志 → 带样式的片段。代码行走高亮，其余整行一个样式。"""
+    if kind.startswith("code:"):
+        return _code_fragments(text, kind[5:])
+    if not text:
+        return []
+    return [(LINE_CLASS.get(kind, ""), text)]
+
+
+def _wrap_fragments(line: list[tuple[str, str]], width: int) -> list[list[tuple[str, str]]]:
+    """把一行（带样式的片段）按**显示宽度**折开，中文算 2 列。
+
+    界面要自己取"最后几行"填满日志区，折行就不能交给终端：算宽一点，
+    取到的尾巴会多出半行；算窄一点，行尾会被截掉。
+    """
+    from prompt_toolkit.utils import get_cwidth
+
+    width = max(4, width)
+    wrapped: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    used = 0
+    for style, raw in line:
+        piece = raw.replace("\t", "    ").replace("\r", "")
+        for char in piece:
+            size = get_cwidth(char)
+            if current and used + size > width:
+                wrapped.append(current)
+                current, used = [], 0
+            if current and current[-1][0] == style:  # 相邻同样式合并，减少片段数
+                current[-1] = (style, current[-1][1] + char)
+            else:
+                current.append((style, char))
+            used += size
+    wrapped.append(current)
+    return wrapped
+
+
+def _fit(text: str, width: int, *, keep_tail: bool = False) -> str:
+    """把一段文字补到**固定显示宽度**（中文算 2 列），太长就截断加省略号。
+
+    状态栏靠它排"制表位"：阶段名一长一短、token 数一进位，整条就不该跟着抖。
+    `keep_tail=True` 从尾巴留（路径这种后缀比前缀有用）。
+    """
+    from prompt_toolkit.utils import get_cwidth
+
+    width = max(1, width)
+    if get_cwidth(text) > width:
+        budget = width - 1  # 给省略号留一列
+        if keep_tail:
+            kept = ""
+            for char in reversed(text):
+                if get_cwidth(kept) + get_cwidth(char) > budget:
+                    break
+                kept = char + kept
+            text = "…" + kept
+        else:
+            kept = ""
+            for char in text:
+                if get_cwidth(kept) + get_cwidth(char) > budget:
+                    break
+                kept += char
+            text = kept + "…"
+    return text + " " * max(0, width - get_cwidth(text))
+
+
+class ChatTUI:
+    """全屏常驻界面：日志在界面内部滚动，状态栏 + 输入行钉在窗口最后两行。
+
+    这是"Codex 那种手感"：底栏**永远**在窗口最底下，跟这一轮输出了多少行
+    无关；输出在界面自己的日志区里往上滚。代价是走终端的**备用屏幕**
+    （alternate screen），退出后本次对话不会留在终端 scrollback 里——这是
+    全屏换来的，不是 bug。
+
+    渲染只剩**一个写者**：界面自己。日志只存在 `_log` / `_pending`，由
+    `_transcript_fragments()` 按当前窗口尺寸取"最后几行"画出来，一个字节都
+    不写 stdout。于是既没有 `patch_stdout` 那套"擦掉 → 打印 → 画回来"，
+    也没有"写出去半行、底栏被拽到正文中间"的问题（前两版就是那么坏的）；
+    rich 更是完全不参与——模块级 `console` 在导入时就抓死了原始 stdout，
+    上一版花屏正是它绕过界面直接写造成的。
     """
 
     def __init__(self, status: ChatStatus) -> None:
         from prompt_toolkit.application import Application
         from prompt_toolkit.buffer import Buffer
         from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout import Dimension, HSplit, Layout, VSplit, Window
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+        from prompt_toolkit.styles import Style
 
         self.status = status
         self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self._log: list[tuple[str, str]] = []  # (行类型, 文本)，一行一条
+        self._pending = ""  # 还没换行的那一行（流式 token 正往里长）
+        self._pending_kind = "assistant"
+        self._code: str | None = None  # 代码围栏的语言；None = 不在代码块里
+        self._folded = True  # 过程信息（工具调用）默认折叠，跟 Codex 一样
+        self._scroll = 0  # 从底部往上回滚了几屏行；0 = 跟着最新输出走
         self.input = Buffer(multiline=False, accept_handler=self._on_accept)
 
         bindings = KeyBindings()
@@ -226,40 +469,260 @@ class ChatTUI:
         @bindings.add("c-c")
         @bindings.add("c-d")
         def _quit(event: Any) -> None:
-            self._lines.put_nowait(None)
+            self._lines.put_nowait(None)  # None = 用户要走，别当成空行
             event.app.exit()
+
+        @bindings.add("pageup")
+        def _page_up(event: Any) -> None:
+            self._scroll_by(self._page_size())
+
+        @bindings.add("pagedown")
+        def _page_down(event: Any) -> None:
+            self._scroll_by(-self._page_size())
+
+        @bindings.add("up")
+        def _line_up(event: Any) -> None:
+            self._scroll_by(1)
+
+        @bindings.add("down")
+        def _line_down(event: Any) -> None:
+            self._scroll_by(-1)
+
+        @bindings.add("end")
+        def _to_bottom(event: Any) -> None:
+            self._scroll = 0
+            self.refresh()
+
+        @bindings.add("c-o")
+        def _toggle_fold(event: Any) -> None:
+            self._folded = not self._folded
+            self.refresh()
+
+        style = Style.from_dict(TUI_STYLE)
 
         self.app = Application(
             layout=Layout(
                 HSplit(
                     [
-                        # 只占两行：状态栏 + 输入行。输出的日志**不**在这里，
-                        # 它走普通 print 往界面上方滚（由 patch_stdout 负责让位）。
-                        Window(FormattedTextControl(status.text), height=1),
-                        Window(BufferControl(buffer=self.input), height=1),
+                        # 日志区吃掉除底栏之外的全部高度，自己滚动
+                        Window(
+                            FormattedTextControl(self._transcript_fragments),
+                            height=Dimension(weight=1),
+                            wrap_lines=False,
+                        ),
+                        Window(
+                            FormattedTextControl(self._status_fragments),
+                            height=1,
+                            wrap_lines=False,
+                            # 样式挂在窗口上，prompt_toolkit 才会把**整行**填满，
+                            # 而不是只反白我们写出去的那几个字
+                            style="class:bar",
+                        ),
+                        VSplit(
+                            [
+                                # 提示符常驻在最左边，光标钉在最后一行
+                                Window(
+                                    FormattedTextControl("› ", style="class:prompt"),
+                                    width=2,
+                                    height=1,
+                                ),
+                                Window(BufferControl(buffer=self.input), height=1),
+                            ]
+                        ),
                     ]
                 )
             ),
             key_bindings=bindings,
-            full_screen=False,
+            style=style,
+            full_screen=True,  # 备用屏幕：底栏钉在窗口最底，退出后终端复原
         )
+
+    def _effective_pending_kind(self) -> str:
+        """还在流式的那一行属于什么类型（代码块里就是代码行）。"""
+        if self._code is not None and self._pending_kind == "assistant":
+            return f"code:{self._code}"
+        return self._pending_kind
+
+    def _display_items(self, limit: int) -> list[tuple[str, list[tuple[str, str]]]]:
+        """把最后 `limit` 条日志整理成"这一帧要画的行"。
+
+        做两件事：换组时插一个空行（正文 / 工具 / 用户各自成段），以及把连着的
+        过程信息折成一行。只处理尾巴，所以每帧的工作量跟对话长短无关。
+        """
+        start = max(0, len(self._log) - limit)
+        # 折叠得看到整段的开头，否则会把"延续行"当成第一行
+        while (
+            self._folded
+            and start > 0
+            and self._log[start][0] == "tool"
+            and self._log[start - 1][0] == "tool"
+        ):
+            start -= 1
+
+        items: list[tuple[str, list[tuple[str, str]]]] = []
+        previous = _group_of(self._log[start - 1][0]) if start > 0 else None
+        for kind, text in self._log[start:]:
+            if _needs_separator(items, previous, _group_of(kind)):
+                items.append(("", []))
+            fragments = _line_fragments(kind, text)
+            if not fragments and items and not items[-1][1]:
+                continue  # 上一行已经是空行，别再堆一行
+            items.append((kind, fragments))
+            previous = _group_of(kind)
+
+        if self._pending:
+            kind = self._effective_pending_kind()
+            if _needs_separator(items, previous, _group_of(kind)):
+                items.append(("", []))
+            items.append((kind, _line_fragments(kind, self._pending)))
+
+        return self._fold(items)
+
+    def _fold(
+        self, items: list[tuple[str, list[tuple[str, str]]]]
+    ) -> list[tuple[str, list[tuple[str, str]]]]:
+        """折叠：连着的过程信息（工具调用）只留第一行，其余收起来。"""
+        if not self._folded:
+            return items
+        folded: list[tuple[str, list[tuple[str, str]]]] = []
+        index = 0
+        while index < len(items):
+            if items[index][0] != "tool":
+                folded.append(items[index])
+                index += 1
+                continue
+            start = index
+            while index < len(items) and items[index][0] == "tool":
+                index += 1
+            run = items[start:index]
+            if len(run) == 1:
+                folded.extend(run)
+                continue
+            first = "".join(text for _style, text in run[0][1])
+            folded.append(("tool", [("class:tool", f"{first}   …共 {len(run)} 行，Ctrl-O 展开")]))
+        return folded
+
+    def _render_lines(self, rows: int, columns: int) -> list[list[tuple[str, str]]]:
+        """日志区这一帧要画的行（片段化），折行后取最后 (rows-2) 行。
+
+        只处理最后 (rows-2 + 回滚行数) 条**源日志**：一条源日志至少占一屏行，
+        再往前的那些一定看不见。回滚时窗口整体往上挪 `_scroll` 屏行。
+        """
+        height = max(1, rows - 2)  # 让出状态栏和输入行
+        wrapped: list[list[tuple[str, str]]] = []
+        for _kind, fragments in self._display_items(height + self._scroll + 1):
+            wrapped.extend(_wrap_fragments(fragments, columns))
+        end = min(len(wrapped), max(height, len(wrapped) - self._scroll))
+        return wrapped[max(0, end - height) : end]
+
+    def _page_size(self) -> int:
+        """一屏能看多少行日志（让出底栏两行）。"""
+        return max(1, self.app.output.get_size().rows - 3)
+
+    def _scroll_by(self, delta: int) -> None:
+        """滚动日志区。`delta > 0` 往上看历史，负数往回走；到头/到底自动夹住。"""
+        size = self.app.output.get_size()
+        height = max(1, size.rows - 2)
+        total = sum(
+            len(_wrap_fragments(fragments, size.columns))
+            for _kind, fragments in self._display_items(10_000)
+        )
+        self._scroll = min(max(0, total - height), max(0, self._scroll + delta))
+        self.refresh()
+
+    def _transcript_fragments(self) -> list[tuple[str, str]]:
+        size = self.app.output.get_size()
+        fragments: list[tuple[str, str]] = []
+        for index, line in enumerate(self._render_lines(size.rows, size.columns)):
+            if index:
+                fragments.append(("", "\n"))
+            fragments.extend(line)
+        return fragments
+
+    def _status_fragments(self) -> list[tuple[str, str]]:
+        """底栏内容（带样式）。交给 prompt_toolkit 渲染，**不经过 rich**。
+
+        底色是靠 `Window(style="class:bar")` 铺满整行的，这里只管每段的前景色。
+        """
+        if self.status.phase:
+            lead = ("class:bar.busy", f" {self.status.spinner()} {self.status.phase} ")
+        else:
+            lead = ("class:bar.idle", " ● 空闲 ")
+        # 徽标补到固定宽度：不然"空闲"和"执行 fs_read"一换，后面全跟着平移
+        fragments = [(lead[0], _fit(lead[1], 20)), *self.status.segments(aligned=True)]
+        if self._scroll:
+            fragments.append(("class:bar.hint", f" │ ↑回滚 {self._scroll} 行（End 回底）"))
+        return fragments
 
     def _on_accept(self, buffer: Any) -> bool:
         self._lines.put_nowait(buffer.text)
         buffer.reset()
         return True
 
-    def write(self, text: str) -> None:
-        """输出日志。**纯文本、不走 rich**：rich 的分片写入会和界面渲染抢终端。"""
-        if text:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+    def write(self, text: str, kind: str = "assistant") -> None:
+        """追加日志。**不写 stdout、不走 rich**：界面自己画（见类文档）。
+
+        `kind` 决定这一行怎么上色、能不能折叠：`assistant`（正文）、`tool`
+        （工具调用/结果，暗灰 + 可折叠）、`error`。没换行的尾巴留在 `_pending`
+        里继续长，所以流式 token 是逐字出现在日志区最后一行的。
+        """
+        if not text:
+            return
+        if not self._pending:
+            self._pending_kind = kind
+        self._pending += text
+        if "\n" not in self._pending:
+            self.refresh()
+            return
+        complete, self._pending = self._pending.rsplit("\n", 1)
+        pending_kind, self._pending_kind = self._pending_kind, kind
+        for line in complete.split("\n"):
+            self._push(pending_kind, line)
+        self.refresh()
+
+    def _push(self, kind: str, text: str) -> None:
+        """收下一整行。代码围栏在这里处理，因为围栏只认整行。"""
+        if kind == "assistant":
+            stripped = text.strip()
+            if stripped.startswith("```"):
+                # 开/闭围栏自己不上屏——只留代码本体，省得占两行
+                self._code = None if self._code is not None else stripped[3:].strip()
+                return
+            if self._code is not None:
+                self._log.append((f"code:{self._code}", text))
+                return
+        self._log.append((kind, text))
+
+    def end_line(self) -> None:
+        """把还在长的那行收进日志（它后面要接别的内容了）。"""
+        if self._pending:
+            kind, text = self._effective_pending_kind(), self._pending
+            self._pending = ""
+            self._push(kind, text)
+
+    def echo_user(self, line: str) -> None:
+        """把用户刚才那句回显到日志里。
+
+        上一轮的回答末尾可能没有换行（模型就这么吐的），不先收一下的话，
+        `你 > ...` 会接在回答最后一行屁股后面。
+        """
+        self.end_line()
+        self._push("user", f"你 > {line}")
+        self.refresh()
 
     async def run(self) -> None:
         await self.app.run_async()
 
     def exit(self) -> None:
-        self.app.exit()
+        """请求退出。**必须能重复调用**。
+
+        Ctrl-C / Ctrl-D 的绑定里已经 `app.exit()` 过一次了，主循环收尾时会再
+        调一次；prompt_toolkit 第二次会抛 "Return value already set"——所以这里
+        先看 future：没跑起来是 `None`，跑完了是 `done()`，两种都说明无事可做。
+        """
+        future = self.app.future
+        if future is not None and not future.done():
+            self.app.exit()
 
     def refresh(self) -> None:
         self.app.invalidate()
@@ -812,51 +1275,95 @@ async def _chat(
 
 
 async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_approve: bool) -> None:
-    """常驻界面主循环。
+    """全屏界面主循环。
 
-    界面只占**最底下两行**（状态栏 + 输入行）；日志走 `tui.write()` 的纯文本写，
-    由 `patch_stdout()` 负责"擦掉那两行 → 打印 → 再画回来"，
-    于是输出正常往上滚，提示符始终钉在最后一行。
+    界面占满整个窗口：上面是日志区（内部滚动，每帧只画最后几行），最后两行
+    是状态栏 + 输入行。输出全部走 `tui.write()` 进界面缓冲区，一个字节都不写
+    stdout，所以底栏**永远**在窗口最底下，跟这一轮输出了多少行无关。
+
+    `patch_stdout()` 只当保险留着：这条路自己不该有任何 stdout 写入，但库偶尔
+    会写（比如日志），让它走界面渲染器，总比直接糊在备用屏幕上好。
     """
     from prompt_toolkit.patch_stdout import patch_stdout
 
     tui = ChatTUI(status)
     with patch_stdout():
         runner = asyncio.create_task(tui.run())
+        ticker = asyncio.create_task(_spin(tui))
         last_seq = 0
         try:
             while True:
-                line = (await tui.next_line() or "").strip()
+                raw = await tui.next_line()
+                if raw is None:  # Ctrl-C / Ctrl-D：界面已退出，必须跟着走
+                    break
+                line = raw.strip()
                 if not line:
                     continue
                 if line.lower() in {"exit", "quit", ":q"}:
                     break
-                tui.write(f"\n你 > {line}\n")
+                tui.echo_user(line)
+                status.set_phase("思考中")
+                tui.refresh()
                 try:
                     sent = await client.send_message(session_id, line)
                 except Exception as exc:  # 发一条消息失败不该把整个会话带走
                     tui.write(f"发送失败：{exc}\n")
+                    status.clear_phase()
+                    tui.refresh()
                     continue
                 turn_id = str(sent["turn_id"])
-                async for event in client.stream_events(session_id, after_seq=last_seq):
-                    last_seq = event.seq
-                    if event.type.value == "approval.required":
-                        # 界面里的交互式审批还没做：目前只认 --yes，否则按拒绝
-                        tui.write(f"\n需要确认：{event.data.get('name')}（此处暂按拒绝）\n")
-                        await client.approve(
-                            session_id,
-                            str(event.data.get("call_id", "")),
-                            granted=bool(auto_approve),
+                try:
+                    async for event in client.stream_events(session_id, after_seq=last_seq):
+                        last_seq = event.seq
+                        kind = event.type.value
+                        if kind == "approval.required":
+                            # 界面里的交互式审批还没做：目前只认 --yes，否则按拒绝
+                            tui.write(f"\n需要确认：{event.data.get('name')}（此处暂按拒绝）\n")
+                            await client.approve(
+                                session_id,
+                                str(event.data.get("call_id", "")),
+                                granted=bool(auto_approve),
+                            )
+                            continue
+                        if kind == "tool.call":
+                            status.set_phase(f"执行 {event.data.get('name')}")
+                        elif kind == "tool.result":
+                            status.set_phase("思考中")
+                        elif kind == "text.delta":
+                            status.set_phase("输出中")
+                        # 过程信息（工具调用/等待确认）走暗灰并可折叠；其余是正文
+                        line_kind = (
+                            "error"
+                            if kind == "error"
+                            else "tool"
+                            if kind in {"tool.call", "tool.result", "approval.required"}
+                            else "assistant"
                         )
-                        continue
-                    tui.write(format_event_plain(event))
-                    if event.type.value == "turn.done" and event.turn_id == turn_id:
-                        status.track(event.data.get("usage") or {})
-                        tui.refresh()
-                        break
+                        tui.write(format_event_plain(event), line_kind)
+                        if kind == "turn.done" and event.turn_id == turn_id:
+                            status.track(event.data.get("usage") or {})
+                            break
+                finally:
+                    # 正常收尾和流中途断掉都要收回空闲：底栏要是一直转圈，
+                    # 那它显示的就不是状态，是谎话
+                    status.clear_phase()
+                    tui.refresh()
         finally:
+            ticker.cancel()
             tui.exit()
-            await runner
+            await asyncio.gather(runner, ticker, return_exceptions=True)
+
+
+async def _spin(tui: ChatTUI) -> None:
+    """执行期间让底栏逐帧转圈——它得"看着是活的"，而不是一张静止的图。
+
+    只在有阶段时刷新，空闲时一个 tick 都不发，省得白白重绘。
+    """
+    while True:
+        await asyncio.sleep(0.1)
+        if tui.status.phase:
+            tui.status.tick()
+            tui.refresh()
 
 
 def _ask_approval(data: Any) -> bool:
