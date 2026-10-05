@@ -112,14 +112,6 @@ class RetrievalIndex:
             )
         return written
 
-    async def stats(self) -> dict[str, int]:
-        await self.ensure_schema()
-        return {
-            "chunks": int(await self.db.scalar("SELECT COUNT(*) FROM chunks") or 0),
-            "files": int(await self.db.scalar("SELECT COUNT(*) FROM chunk_files") or 0),
-            "dim": self.embedder.dim,
-        }
-
     async def _clear(self) -> None:
         await self.db.execute("DELETE FROM chunks")
         await self.db.execute("DELETE FROM chunks_fts")

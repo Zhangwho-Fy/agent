@@ -13,11 +13,3 @@ class AgentError(Exception):
 
 class PathEscapeError(AgentError):
     """路径解析后落在工作区之外（包含软链接逃逸、`../` 逃逸）。"""
-
-
-class ToolExecutionError(AgentError):
-    """工具执行过程中的基础设施故障（不是"命令返回非零"）。"""
-
-
-class ToolNotFoundError(AgentError):
-    """模型请求了不存在的工具。"""

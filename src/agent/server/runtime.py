@@ -75,10 +75,6 @@ class SessionRuntime:
             db=db,
         )
 
-    @property
-    def pending_approvals(self) -> list[str]:
-        return list(self._pending)
-
     async def run_turn(self, prompt: str, *, turn_id: str) -> TurnResult:
         """跑一轮。调用方负责把它的返回值落库（或用返回的 usage 更新 turn 行）。"""
         return await stream_turn(

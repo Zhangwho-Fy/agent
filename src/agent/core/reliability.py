@@ -1,9 +1,11 @@
-"""可靠性语义：事件编号、对外事件流、幂等键。
+"""可靠性语义：事件编号与对外事件流。
 
 这些是框架**不提供**的部分，也是本项目区别于"照教程搭的 demo"的地方：
 框架管"怎么跑"，这里管"跑过之后有什么凭据、重发会怎样、断线后怎么补齐"。
 
-阶段 1 先在内存里实现，阶段 2 把落库接进来——接口不变，换的是实现。
+幂等键的**事实源在 SQLite**（`store/schema.sql` 的 `idempotency` 表 +
+`store/repo.py` 的读写），不在这里——进程内的 map 顶不住重启，
+阶段 2 接落库时就把它换掉了。
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from typing import Any
 
 from .bus import EventBus
 from .events import Event, EventType
-from .ids import new_id
 
 logger = logging.getLogger(__name__)
 
@@ -70,24 +71,3 @@ class EventEmitter:
         if self.on_event is not None:
             self.on_event(event)
         return event
-
-
-class IdempotencyStore:
-    """幂等键 → 已有 turn 的映射。
-
-    为什么需要：Agent 的一轮可能跑几十秒，客户端超时重发是常态。
-    没有幂等键，同一条消息会被执行两次——工具可能真的改了文件。
-    """
-
-    def __init__(self) -> None:
-        self._turns: dict[str, str] = {}
-
-    def lookup(self, key: str) -> str | None:
-        """返回已存在的 turn_id；没有则返回 None。"""
-        return self._turns.get(key)
-
-    def remember(self, key: str, turn_id: str) -> None:
-        self._turns[key] = turn_id
-
-    def new_turn_id(self) -> str:
-        return new_id("turn")
