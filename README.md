@@ -13,6 +13,7 @@
 - **可重放**：`agent replay` 不调模型，把一次会话的事件流按 seq 原序还原
 - **可评测**：golden 集走回放执行，**不联网、不要密钥、几秒出通过率**
 - **服务化**：`agent serve` 提供 HTTP + SSE（任务在服务端跑，客户端只是订阅者），断线重连按 `Last-Event-ID` 补齐；`agent chat` 是配套的交互式 CLI
+- **交互式界面**：`agent chat` 是全屏常驻界面（状态栏 + 输入行钉在最底，日志在内滚动）；思考过程暗灰可折叠、代码高亮、写操作当场问你、`agent resume` 挑历史会话并先把历史画出来
 - **代码检索**：切块 + FTS5 词法 + 向量语义 + RRF 混合排序，10 条查询 **recall@5 = 90%、MRR = 0.758**（离线跑，1.7 秒）
 - **CI**：每次 push 自动跑 ruff + pytest，全程不注入密钥
 
@@ -34,7 +35,8 @@ uv run agent run -s <会话 id> "那个文件的异常处理是怎么做的？"
 
 # 交互式：一个终端跑服务端，另一个终端聊天
 uv run agent serve                 # 打印访问令牌
-uv run agent chat --token <令牌>    # 多轮对话，写操作会停下来问你
+uv run agent chat --token <令牌>    # 多轮对话（全屏界面），写操作会停下来问你
+uv run agent resume --token <令牌>  # 列出历史会话，挑一个继续（历史先画出来）
 ```
 
 ## 命令
@@ -45,7 +47,7 @@ uv run agent chat --token <令牌>    # 多轮对话，写操作会停下来问�
 | `agent run -s <会话> "任务"` | 接着已有会话跑 |
 | `agent run -y "任务"` | 自动批准所有写操作（无人值守） |
 | `agent run -w <目录> "任务"` | 换个工作区 |
-| `agent sessions` | 列出最近的会话 |
+| `agent sessions [--json]` | 列出最近的会话（含每个会话最后一句用户消息），`--json` 给脚本用 |
 | `agent replay <会话> [--raw]` | 重放事件流，**不调模型** |
 | `agent serve` | 启动 HTTP + SSE 服务端 |
 | `agent chat [-s 会话] [--token ...]` | 交互式多轮对话（全屏界面，走服务端） |
@@ -78,13 +80,12 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 | 3 工程化（录放、golden 集、CI） | ✅ |
 | 4 服务化（HTTP + SSE、断线续传、幂等、交互式 CLI） | ✅ |
 | 5 检索（切块、混合检索、recall@5 评测） | ✅ |
-| 6 扩展（MCP 适配器、可选 C++ 工具） | 下一步 |
+| 6 扩展（MCP 适配器、可选 C++ 工具） | 暂缓：没有真实需求前不引入（MCP 的价值是接第三方生态，代价是沙箱语义变弱） |
 
-编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。详细进度与踩过的坑见 [AGENTS.md](AGENTS.md)。
+编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。
 
 ## 文档
 
-- [AGENTS.md](AGENTS.md) — **交接文档**：当前状态、换机器继续的步骤、代码地图、设计决定、已知坑
-
-> 更细的设计文档（`docs/design.md`、`docs/detailed-design.md`、`docs/stage-1.md`、`docs/knowledge.md`）
-> 是**本地文档**，已从版本控制移除，克隆这个仓库不会有它们。
+设计文档、接口契约（`docs/protocol.md`）和**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
+代码地图、设计决定、踩过的坑）都是**本地文档**，已从版本控制移除——克隆这个仓库不会有它们，
+仓库里只有代码、测试和这份 README。
