@@ -1185,6 +1185,46 @@ def version() -> None:
     console.print(f"agent {installed}")
 
 
+def _looks_like_placeholder(key: str) -> bool:
+    """密钥是不是 `.env.example` 里那种占位符（"已设置"但根本调不通，最坑）。"""
+    if not key:
+        return False
+    lowered = key.lower()
+    if len(key) < 20:
+        return True
+    return any(marker in lowered for marker in ("xxx", "your", "changeme", "placeholder", "填入"))
+
+
+def _db_probe(path: Path) -> str:
+    """会话库体检：打不开（权限/被锁）或表结构不对，都要在 doctor 里现形。"""
+    import sqlite3
+
+    if not path.exists():
+        return f"{path}（还没有，跑一次 `agent run` 会建）"
+    size_mb = path.stat().st_size / 1024 / 1024
+    try:
+        conn = sqlite3.connect(path, timeout=1.0)
+        try:
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"{path}（{size_mb:.1f}MB，读失败：{type(exc).__name__}: {exc}）"
+    return f"{path}（{size_mb:.1f}MB，{sessions} 会话 / {events} 事件）"
+
+
+def _port_probe(host: str, port: int) -> str:
+    """默认端口通不通——"服务端到底起没起"这个问题，别再靠猜。"""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return f"{host}:{port} 已被占用（服务端大概率在跑）"
+    except OSError:
+        return f"{host}:{port} 空闲"
+
+
 @app.command()
 def doctor() -> None:
     """体检：Python 版本、依赖、配置、密钥。"""
@@ -1221,14 +1261,18 @@ def doctor() -> None:
         table.add_row("配置加载", "OK")
         table.add_row("模型", f"{settings.provider} / {settings.model}")
         table.add_row("工作区", str(settings.resolved_workspace))
-        table.add_row("会话库", str(settings.resolved_db_path))
+        table.add_row("会话库", _db_probe(settings.resolved_db_path))
         if settings.provider == "replay":
             table.add_row("密钥", "不需要（回放模式）")
+        elif _looks_like_placeholder(settings.api_key):
+            table.add_row("密钥", "看起来还是占位符  去 .env 填真 key")
+            problems.append("AGENT_API_KEY 像占位符")
         elif settings.api_key:
-            table.add_row("密钥", "已设置")
+            table.add_row("密钥", f"已设置（{len(settings.api_key)} 字符）")
         else:
             table.add_row("密钥", "未设置  需要在 .env 里填 AGENT_API_KEY")
             problems.append("未设置 AGENT_API_KEY")
+        table.add_row("端口", _port_probe(settings.host, settings.port))
 
     console.print(table)
     if problems:
@@ -1258,8 +1302,13 @@ def run(
     ] = None,
     session: Annotated[
         str | None,
-        typer.Option("--session", "-s", help="接着已有会话跑（默认每次新建）"),
+        typer.Option(
+            "--session", "-s", help="接着已有会话跑（默认每次新建）；`-s last` 接最近一个"
+        ),
     ] = None,
+    last: Annotated[
+        bool, typer.Option("--last", help="接着最近一个会话跑（等价于 -s last）")
+    ] = False,
     yes: Annotated[
         bool,
         typer.Option("--yes", "-y", help="自动批准所有写操作（无人值守时用）"),
@@ -1269,8 +1318,29 @@ def run(
     settings = Settings()
     if workspace is not None:
         settings.workspace = workspace
-    code = asyncio.run(_run_once(prompt, settings, session_id=session, auto_approve=yes))
+    code = asyncio.run(
+        _run_once(prompt, settings, session_id=session, use_last=last, auto_approve=yes)
+    )
     raise typer.Exit(code=code)
+
+
+async def _resolve_session(db: Any, session_id: str | None, use_last: bool) -> str | None:
+    """把 `-s last` / `--last` 解析成真实的会话 id。
+
+    空库时返回 None（调用方新建一个）——"接着上次"在还没跑过任何任务时不该直接报错。
+    """
+    if session_id != "last" and not use_last:
+        return session_id
+    from ..store import repo
+
+    rows = await repo.session_summaries(db, limit=1)
+    if not rows:
+        console.print("[yellow]还没有历史会话，这次新建一个[/yellow]")
+        return None
+    latest = rows[0]
+    title = " ".join(str(latest.get("title") or "").split())[:24]
+    console.print(f"[dim]接着最近一个会话 …{str(latest['id'])[-6:]}（{title or '未命名'}）[/dim]")
+    return str(latest["id"])
 
 
 async def _run_once(
@@ -1278,6 +1348,7 @@ async def _run_once(
     settings: Settings,
     *,
     session_id: str | None = None,
+    use_last: bool = False,
     auto_approve: bool = False,
 ) -> int:
     """构建图并跑一轮：落库 → 驱动图（可能等审批）→ 收尾落库。
@@ -1322,6 +1393,7 @@ async def _run_once(
     if recovered:
         console.print(f"[yellow]恢复：{recovered} 个没跑完的 turn 已标记为 interrupted[/yellow]")
 
+    session_id = await _resolve_session(db, session_id, use_last)
     if session_id is None:
         session_id = new_id("sess")
         await repo.create_session(
@@ -1512,12 +1584,28 @@ def replay(
         int, typer.Option("--from-seq", help="从第几条事件之后开始，断线续传的语义")
     ] = 0,
     raw: Annotated[bool, typer.Option("--raw", help="逐条显示，不合并连续的 text.delta")] = False,
+    follow: Annotated[
+        bool,
+        typer.Option("--follow", "-f", help="放完已有的继续跟新事件（Ctrl-C 退出）"),
+    ] = False,
 ) -> None:
-    """按原顺序重放会话的事件流。**不调用模型**，纯读库。"""
-    raise typer.Exit(code=asyncio.run(_replay(Settings(), session_id, from_seq, raw)))
+    """按原顺序重放会话的事件流。**不调用模型**，纯读库。
+
+    `--from-seq` 从某条之后开始（断线续传语义）、`--raw` 逐条看分片、
+    `--follow` 放完已有的继续跟新事件（另一个终端在跑任务时，这里能实时看）。
+    """
+    raise typer.Exit(code=asyncio.run(_replay(Settings(), session_id, from_seq, raw, follow)))
 
 
-async def _replay(settings: Settings, session_id: str, from_seq: int, raw: bool = False) -> int:
+async def _replay(
+    settings: Settings,
+    session_id: str,
+    from_seq: int,
+    raw: bool = False,
+    follow: bool = False,
+    *,
+    poll_seconds: float = 0.2,
+) -> int:
     from ..store import repo
     from ..store.db import Database
 
@@ -1540,12 +1628,43 @@ async def _replay(settings: Settings, session_id: str, from_seq: int, raw: bool 
     for line in render_events(events, raw=raw):
         console.print(line, markup=False, highlight=False)
 
+    if follow:
+        start = events[-1].seq if events else from_seq
+        await _follow_events(db, session_id, start, raw, poll_seconds)
+
     turns = await repo.list_turns(db, session_id)
     console.print(
         "[dim]turn 状态：" + "，".join(f"{row['id']}={row['status']}" for row in turns) + "[/dim]"
     )
     await db.close()
     return 0
+
+
+async def _follow_events(
+    db: Any, session_id: str, after_seq: int, raw: bool, poll_seconds: float
+) -> None:
+    """接着跟新事件：**轮询库里的 events**（纯读库，不依赖服务端）。
+
+    为什么不用总线订阅：`replay` 是离线工具，可能跟正在跑任务的进程不在同一个
+    进程里——跨进程可见的事实源只有库。轮询间隔默认 0.2s，本地读一条 SQL 的开销
+    可以忽略。
+    """
+    from ..store import repo
+
+    console.print("[dim]--follow：有新事件就打印，Ctrl-C 退出[/dim]")
+    try:
+        while True:
+            await asyncio.sleep(poll_seconds)
+            rows = await repo.list_events(db, session_id, after_seq=after_seq)
+            if not rows:
+                continue
+            events = [repo.row_to_event(row) for row in rows]
+            after_seq = events[-1].seq
+            for line in render_events(events, raw=raw):
+                console.print(line, markup=False, highlight=False)
+    except KeyboardInterrupt:
+        console.print()
+        console.print("[dim]停止跟随[/dim]")
 
 
 def render_events(events: list[Any], *, raw: bool = False) -> list[str]:
