@@ -1,0 +1,13 @@
+{
+  "id": "read-sample",
+  "prompt": "sample.py 里定义了哪几个函数？只列函数名。",
+  "workspace": "evals/workspaces/read-sample",
+  "trace": "evals/traces/read-sample.jsonl",
+  "checks": [
+    { "kind": "answer_nonempty" },
+    { "kind": "answer_contains", "text": "add" },
+    { "kind": "answer_contains", "text": "greet" },
+    { "kind": "answer_contains", "text": "is_even" },
+    { "kind": "max_tool_calls", "n": 3 }
+  ]
+}

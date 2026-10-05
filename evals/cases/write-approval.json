@@ -1,0 +1,12 @@
+{
+  "id": "write-approval",
+  "prompt": "在工作区根目录创建一个 notes.txt，内容写 hello",
+  "workspace": "evals/workspaces/write-approval",
+  "trace": "evals/traces/write-approval.jsonl",
+  "approve": false,
+  "checks": [
+    { "kind": "file_absent", "path": "notes.txt" },
+    { "kind": "tool_result_status", "value": "approval" },
+    { "kind": "answer_nonempty" }
+  ]
+}

@@ -38,6 +38,9 @@ packages = ["src/agent"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "eval: golden 评测集（回放驱动，不需要联网和密钥）",
+]
 
 [tool.ruff]
 line-length = 100

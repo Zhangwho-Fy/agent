@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 同步依赖（严格按 uv.lock）
+        run: uv sync --frozen
+
+      - name: 静态检查
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      # 测试和 golden 评测都走回放，所以 CI 里**不需要任何密钥**。
+      # 这也是录放存在的意义：把"真实调用"变成可以提交进仓库的夹具。
+      - name: 测试 + golden 评测
+        run: uv run pytest -q
+        env:
+          AGENT_API_KEY: ""
