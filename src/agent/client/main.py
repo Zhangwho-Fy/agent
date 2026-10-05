@@ -18,6 +18,7 @@ import asyncio
 import importlib
 import importlib.metadata
 import json
+import secrets
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -39,6 +40,42 @@ console = Console()
 
 #: doctor 需要确认能导入的第三方依赖
 REQUIRED_MODULES = ("pydantic", "pydantic_settings", "openai", "fastapi", "typer", "rich")
+
+
+class EventRenderer:
+    """把事件渲染到终端。`run`（本地直连）和 `chat`（走服务端）共用这一份。"""
+
+    def __init__(self) -> None:
+        self.streamed = False
+
+    def reset(self) -> None:
+        """新的一轮开始前清掉状态，否则上一轮流过的文本会把这一轮吞掉。"""
+        self.streamed = False
+
+    def __call__(self, event: Any) -> None:
+        data = event.data
+        kind = event.type.value
+        if kind == "text.delta":
+            self.streamed = True
+            console.print(str(data.get("text", "")), end="", markup=False, highlight=False)
+        elif kind == "text.done":
+            # 逐字流已经打过了就不重复；没有流式分片时（例如轮数用尽的收尾消息）
+            # 在这里补打一次，否则终端上是空白
+            if not self.streamed and data.get("text"):
+                console.print(str(data["text"]), markup=False, highlight=False)
+        elif kind == "tool.call":
+            args = json.dumps(data.get("args", {}), ensure_ascii=False)
+            console.print(f"\n[dim]→ {data.get('name')} {args}[/dim]")
+        elif kind == "tool.result":
+            status = data.get("status")
+            extra = f" {data['duration_ms']}ms" if data.get("duration_ms") else ""
+            style = "dim" if status == "ok" else "yellow"
+            console.print(f"[{style}]  ← {status}{extra}[/{style}]")
+        elif kind == "approval.required":
+            args = json.dumps(data.get("args", {}), ensure_ascii=False)
+            console.print(f"\n[yellow]需要确认[/yellow] {data.get('name')} {args}")
+        elif kind == "error":
+            console.print(f"\n[red]错误：{data.get('message')}[/red]")
 
 
 @app.callback()
@@ -161,7 +198,6 @@ async def _run_once(
     在没有装齐依赖时也能用。
     """
     from ..core.bus import EventBus
-    from ..core.events import Event, EventType
     from ..core.ids import new_id
     from ..core.reliability import EventEmitter
     from ..graph.bridge import Approver, recursion_limit_for, stream_turn
@@ -229,31 +265,7 @@ async def _run_once(
         sink=lambda event: repo.append_event(db, event),
     )
 
-    streamed = False
-
-    def render(event: Event) -> None:
-        nonlocal streamed
-        data = event.data
-        if event.type is EventType.TEXT_DELTA:
-            streamed = True
-            console.print(str(data.get("text", "")), end="", markup=False, highlight=False)
-        elif event.type is EventType.TEXT_DONE:
-            # 逐字流已经打过了就不再重复；没有流式分片时（例如轮数用尽的收尾消息）
-            # 在这里补打一次，否则终端上会是空白。
-            if not streamed and data.get("text"):
-                console.print(str(data["text"]), markup=False, highlight=False)
-        elif event.type is EventType.TOOL_CALL:
-            args = json.dumps(data.get("args", {}), ensure_ascii=False)
-            console.print(f"\n[dim]→ {data.get('name')} {args}[/dim]")
-        elif event.type is EventType.TOOL_RESULT:
-            status = data.get("status")
-            extra = f" {data['duration_ms']}ms" if data.get("duration_ms") else ""
-            style = "dim" if status == "ok" else "yellow"
-            console.print(f"[{style}]  ← {status}{extra}[/{style}]")
-        elif event.type is EventType.ERROR:
-            console.print(f"\n[red]错误：{data.get('message')}[/red]")
-
-    emitter.on_event = render
+    emitter.on_event = EventRenderer()
 
     graph = build_graph(
         model=model,
@@ -458,6 +470,142 @@ def render_events(events: list[Any], *, raw: bool = False) -> list[str]:
         lines.append(format_event(event))
     flush()
     return lines
+
+
+@app.command()
+def serve(
+    host: Annotated[str | None, typer.Option("--host", help="监听地址，默认取配置")] = None,
+    port: Annotated[int | None, typer.Option("--port", help="端口，默认取配置")] = None,
+    token: Annotated[
+        str | None, typer.Option("--token", help="访问令牌，不给就随机生成一个")
+    ] = None,
+) -> None:
+    """启动 HTTP + SSE 服务端：任务在这里执行，客户端只是订阅者。"""
+    settings = Settings()
+    if host is not None:
+        settings.host = host
+    if port is not None:
+        settings.port = port
+    if token is not None:
+        settings.auth_token = token
+    if not settings.auth_token:
+        # 默认不是"没有校验"：没配就现生成一个，本地开发也走同一套路径
+        settings.auth_token = secrets.token_urlsafe(16)
+
+    import uvicorn
+
+    from ..server.app import create_app
+
+    console.print(f"[dim]会话库 {settings.resolved_db_path}[/dim]")
+    console.print(f"[bold]服务端[/bold] http://{settings.host}:{settings.port}")
+    console.print(f"[bold]令牌[/bold] {settings.auth_token}")
+    console.print(
+        "[dim]另开一个终端：agent chat --token "
+        f"{settings.auth_token}（或把它写进 AGENT_AUTH_TOKEN）[/dim]"
+    )
+    uvicorn.run(
+        create_app(settings),
+        host=settings.host,
+        port=settings.port,
+        log_level="warning",
+    )
+
+
+@app.command()
+def chat(
+    server: Annotated[str, typer.Option("--server", help="服务端地址")] = "http://127.0.0.1:8765",
+    token: Annotated[
+        str | None, typer.Option("--token", help="访问令牌，默认取 AGENT_AUTH_TOKEN")
+    ] = None,
+    session: Annotated[str | None, typer.Option("--session", "-s", help="接着已有会话聊")] = None,
+    workspace: Annotated[
+        Path | None, typer.Option("--workspace", "-w", help="新建会话时的工作区")
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="自动批准所有写操作")] = False,
+) -> None:
+    """交互式对话：一次启动、多轮问答（任务在服务端跑）。"""
+    settings = Settings()
+    code = asyncio.run(_chat(server, token or settings.auth_token, session, workspace, yes))
+    raise typer.Exit(code=code)
+
+
+async def _chat(
+    server: str,
+    token: str,
+    session_id: str | None,
+    workspace: Path | None,
+    auto_approve: bool,
+) -> int:
+    import httpx
+
+    from ..client.api import AgentClient
+
+    renderer = EventRenderer()
+    async with AgentClient(server, token) as client:
+        try:
+            health = await client.health()
+        except Exception as exc:
+            console.print(f"[red]连不上服务端 {server}：{exc}[/red]")
+            console.print("[dim]先在另一个终端跑：agent serve[/dim]")
+            return 1
+        console.print(f"[dim]已连接 {server}（agent {health.get('version')}）[/dim]")
+
+        if session_id is None:
+            created = await client.create_session(
+                workspace=str(workspace) if workspace else None, profile="code", title="chat"
+            )
+            session_id = str(created["session_id"])
+            console.print(f"[dim]新会话 {session_id}｜工作区 {created['workspace']}[/dim]")
+        else:
+            console.print(f"[dim]继续会话 {session_id}[/dim]")
+        console.print("[dim]输入内容回车发送；exit / quit 退出[/dim]")
+
+        last_seq = 0
+        while True:
+            try:
+                # 故意阻塞：CLI 本来就在等用户输入（换成线程池会踩 AGENTS.md 记的坑）
+                line = input("\n你 > ").strip()  # noqa: ASYNC250
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
+            if line.lower() in {"exit", "quit", ":q"}:
+                break
+
+            renderer.reset()
+            console.print("[bold]agent[/bold] ", end="")
+            try:
+                sent = await client.send_message(session_id, line)
+            except httpx.HTTPStatusError as exc:
+                console.print(
+                    f"[red]发送失败：{exc.response.status_code} {exc.response.text}[/red]"
+                )
+                continue
+            if sent.get("duplicate"):
+                console.print("[yellow]（幂等命中：这条消息已经发过了）[/yellow]")
+            turn_id = str(sent["turn_id"])
+
+            async for event in client.stream_events(session_id, after_seq=last_seq):
+                last_seq = event.seq
+                if event.type.value == "approval.required":
+                    granted = auto_approve or _ask_approval(event.data)
+                    await client.approve(
+                        session_id, str(event.data.get("call_id", "")), granted=granted
+                    )
+                    continue
+                renderer(event)
+                if event.type.value == "turn.done" and event.turn_id == turn_id:
+                    break
+        console.print("\n[dim]再见[/dim]")
+    return 0
+
+
+def _ask_approval(data: Any) -> bool:
+    """终端里问一句。默认拒绝：直接回车不放行。"""
+    args = json.dumps(data.get("args", {}), ensure_ascii=False)
+    console.print(f"[dim]原因：{data.get('reason', '')}[/dim]")
+    answer = input(f"  允许执行 {args} 吗？[y/N] ").strip().lower()
+    return answer in {"y", "yes", "是"}
 
 
 if __name__ == "__main__":
