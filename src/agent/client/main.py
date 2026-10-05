@@ -15,11 +15,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import importlib.metadata
 import json
+import logging
+import os
 import secrets
 import sys
+import time
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,10 +54,12 @@ class EventRenderer:
 
     def __init__(self) -> None:
         self.streamed = False
+        self.thinking = False
 
     def reset(self) -> None:
         """新的一轮开始前清掉状态，否则上一轮流过的文本会把这一轮吞掉。"""
         self.streamed = False
+        self.thinking = False
 
     def __call__(self, event: Any) -> None:
         data = event.data
@@ -60,6 +67,12 @@ class EventRenderer:
         if kind == "text.delta":
             self.streamed = True
             console.print(str(data.get("text", "")), end="", markup=False, highlight=False)
+        elif kind == "reasoning.delta":
+            # 行式模式显示不了"折叠"，但至少要让人知道模型在推理；
+            # 完整的思考过程留给全屏界面（Ctrl-O 展开）。
+            if not self.thinking:
+                self.thinking = True
+                console.print("[dim]· 思考中…（全屏界面里可展开）[/dim]")
         elif kind == "text.done":
             # 逐字流已经打过了就不重复；没有流式分片时（例如轮数用尽的收尾消息）
             # 在这里补打一次，否则终端上是空白
@@ -113,15 +126,11 @@ class ChatStatus:
         self.total += self.last_input + self.last_output
         self.turns += 1
 
-    def text(self) -> str:
-        """整条状态栏的纯文本。行式底栏（`PromptSession` 的 toolbar）要的就是它。"""
-        return "".join(text for _style, text in self.segments())
-
     def segments(self, *, aligned: bool = False) -> list[tuple[str, str]]:
         """状态栏的分段内容（样式类, 文本）。
 
-        这里只负责"哪一段是什么"，颜色在 `TUI_STYLE` 里定；纯文本由 `text()`
-        拼出来，两条路共用同一份内容，不会各写一遍。
+        这里只负责"哪一段是什么"，颜色在 `TUI_STYLE` 里定；纯文本就是把这些
+        片段拼起来（测试里就是这么断言每一段内容和顺序的）。
 
         `aligned=True` 给全屏界面用：会变宽的字段（模型名、数字）补到固定宽度，
         这样阶段名从"空闲"变成"执行 fs_read"、token 数进一位，整条也不会左右抖。
@@ -181,65 +190,216 @@ class ChatStatus:
         return self.SPINNER[self.frame % len(self.SPINNER)]
 
 
-def make_plain_asker() -> Callable[[], Awaitable[str]]:
-    """最朴素的输入：`input()`。也是底栏出问题时的退路。"""
+def tui_problem() -> str | None:
+    """能不能开全屏界面？不行就返回一句人话原因。
 
-    async def plain() -> str:
-        # 故意阻塞：CLI 本来就在等用户；换成线程池会踩 AGENTS.md 记的那个坑
-        return input("\n你 > ")  # noqa: ASYNC250
-
-    return plain
-
-
-def make_asker(status: ChatStatus) -> Callable[[], Awaitable[str]]:
-    """返回"读一行输入"的函数。
-
-    有 `prompt_toolkit` 且确实在终端里跑，就用带底栏的输入框（输入固定在底部，
-    状态栏挂在它下面）；否则退回 `input()`——重定向、CI、管道里没有 tty，
-    底栏那一套根本渲染不出来，硬上只会输出一堆控制字符。
-
-    **必须是 async**：`chat` 跑在事件循环里，而 prompt_toolkit 的同步 `prompt()`
-    会自己 `asyncio.run()`，从运行中的循环里调它会直接抛
-    "asyncio.run() cannot be called from a running event loop"。异步版
-    `prompt_async()` 复用的是当前循环，没有这个问题。
-
-    加依赖：`uv add prompt_toolkit`（没装也能跑，只是没有底栏）。
+    `agent chat` 只有全屏这一套界面了（原先那套行式交互已经删掉）：它靠
+    备用屏幕、鼠标无关的按键和实时重绘，**必须有真终端**。非终端场景
+    （重定向、管道、CI）请用 `agent run`——那是另一条路：一次任务、行式输出。
     """
-    try:
-        from prompt_toolkit import PromptSession
-
-        if not sys.stdout.isatty():
-            raise RuntimeError("不在终端里")
-    except Exception:
-        return make_plain_asker()
-
-    session = PromptSession()
-
-    async def with_toolbar() -> str:
-        return str(await session.prompt_async("你 > ", bottom_toolbar=status.text))
-
-    return with_toolbar
-
-
-def tui_enabled() -> bool:
-    """是否启用"常驻界面"。
-
-    **默认关**。教训是：界面这种东西我这边没有真实终端可验，所以它必须是
-    opt-in——坏了你只要去掉环境变量就回到行式输出，不用改代码、不用回滚。
-
-    想试：`AGENT_CHAT_UI=tui .venv/bin/agent chat ...`
-    """
-    import os
-
-    if os.environ.get("AGENT_CHAT_UI", "").lower() != "tui":
-        return False
     if not sys.stdout.isatty():
-        return False
+        return "当前不是终端（重定向 / 管道 / CI）"
     try:
         import prompt_toolkit  # noqa: F401
     except ImportError:
-        return False
-    return True
+        return "没装 prompt_toolkit（跑一次 `uv sync`）"
+    return None
+
+
+def session_choices(sessions: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """会话列表 → 选择框的条目：值取 session_id，标签是人看的那一行。
+
+    标签里的每一栏都用 `_fit` 补成固定显示宽度（中文两列），所以选单是齐的。
+    """
+    choices: list[tuple[str, str]] = []
+    for row in sessions:
+        session_id = str(row.get("id", ""))
+        title = str(row.get("title") or "").strip() or "(未命名)"
+        when = str(row.get("updated_at") or "").replace("T", " ")[:16]
+        workspace = str(row.get("workspace") or "-")
+        label = (
+            f"{_fit(title, 30)} │ {_fit(when, 16)} │ …{session_id[-6:]} │ "
+            f"{_fit(workspace, 24, keep_tail=True)}"
+        )
+        choices.append((session_id, label))
+    return choices
+
+
+class _SessionPicker:
+    """挑历史会话的小界面（全屏自成一体，跟后面的 TUI 一前一后跑）。
+
+    比 `radiolist_dialog` 多做一件事：**能删**。按 `Delete` 或 `d` 先"上膛"，
+    再按一次才真删——删除不可逆，多一次确认不亏；Esc 取消上膛，再按一次退出。
+    """
+
+    def __init__(
+        self,
+        sessions: list[dict[str, Any]],
+        deleter: Callable[[str], Awaitable[Any]],
+    ) -> None:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Dimension, HSplit, Layout, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.styles import Style
+
+        self._sessions = list(sessions)
+        self._deleter = deleter
+        self._index = 0
+        self._armed = ""  # 已经上膛、等着二次确认的 session_id
+        self._message = "↑/↓ 选择 · Enter 继续 · Delete/d 删除 · Esc 取消"
+
+        bindings = KeyBindings()
+
+        @bindings.add("up")
+        @bindings.add("c-p")
+        def _up(event: Any) -> None:
+            self._move(-1)
+
+        @bindings.add("down")
+        @bindings.add("c-n")
+        def _down(event: Any) -> None:
+            self._move(1)
+
+        @bindings.add("pageup")
+        def _page_up(event: Any) -> None:
+            self._move(-10)
+
+        @bindings.add("pagedown")
+        def _page_down(event: Any) -> None:
+            self._move(10)
+
+        @bindings.add("delete")
+        @bindings.add("d")
+        def _delete(event: Any) -> None:
+            session = self._current()
+            if session is None:
+                return
+            session_id = str(session["id"])
+            if self._armed != session_id:
+                self._armed = session_id
+                self._message = f"再按一次 Delete/d 确认删除「{self._session_title(session)}」"
+                event.app.invalidate()
+                return
+            event.app.create_background_task(self._do_delete(session_id))
+
+        @bindings.add("escape")
+        @bindings.add("c-c")
+        def _cancel(event: Any) -> None:
+            if self._armed:  # 先取消上膛，再按一次才走人
+                self._armed = ""
+                self._message = "已取消删除"
+                event.app.invalidate()
+                return
+            self._leave(None)
+
+        @bindings.add("enter")
+        def _accept(event: Any) -> None:
+            if self._armed:  # 上膛状态下回车 = 不删，继续挑
+                self._armed = ""
+                self._message = "已取消删除"
+                event.app.invalidate()
+                return
+            session = self._current()
+            self._leave(str(session["id"]) if session else None)
+
+        self._list = Window(FormattedTextControl(self._rows), height=Dimension(weight=1))
+        self.app: Any = Application(
+            layout=Layout(
+                HSplit(
+                    [
+                        Window(
+                            FormattedTextControl("继续哪个会话？"),
+                            height=1,
+                            style="class:title",
+                        ),
+                        self._list,
+                        Window(FormattedTextControl(self._hint), height=1, style="class:hint"),
+                    ]
+                )
+            ),
+            key_bindings=bindings,
+            style=Style.from_dict(
+                {
+                    "title": "bold #7aa2f7",
+                    "hint": "#8b93a7",
+                    "selected": "reverse",
+                    "danger": "bg:#5c1f1f #ffcccc bold",
+                }
+            ),
+            full_screen=True,
+        )
+
+    def _session_title(self, session: dict[str, Any]) -> str:
+        title = str(session.get("title") or "").strip()
+        return title or "(未命名)"
+
+    def _leave(self, result: str | None) -> None:
+        """请求退出。跟 `ChatTUI.exit()` 一样要能重复调用——测试里会不跑界面直接用它。"""
+        future = self.app.future
+        if future is not None and not future.done():
+            self.app.exit(result=result)
+
+    def _current(self) -> dict[str, Any] | None:
+        if not self._sessions:
+            return None
+        return self._sessions[min(self._index, len(self._sessions) - 1)]
+
+    def _move(self, delta: int) -> None:
+        if not self._sessions:
+            return
+        self._index = max(0, min(len(self._sessions) - 1, self._index + delta))
+        # 别让选中项跑出可视区：往上顶到底、往下留一屏
+        visible = max(1, self.app.output.get_size().rows - 2)
+        if self._index < self._list.vertical_scroll:
+            self._list.vertical_scroll = self._index
+        elif self._index >= self._list.vertical_scroll + visible:
+            self._list.vertical_scroll = self._index - visible + 1
+        self._armed = ""
+        self._message = "↑/↓ 选择 · Enter 继续 · Delete/d 删除 · Esc 取消"
+        self.app.invalidate()
+
+    def _rows(self) -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = []
+        for index, session in enumerate(self._sessions):
+            if index:
+                fragments.append(("", "\n"))
+            selected = index == self._index
+            style = "class:danger" if self._armed == str(session["id"]) else ""
+            if selected and not style:
+                style = "class:selected"
+            label = session_choices([session])[0][1]
+            fragments.append((style, f"{'❯' if selected else ' '} {label}"))
+        return fragments
+
+    def _hint(self) -> str:
+        return f" {self._message}"
+
+    async def _do_delete(self, session_id: str) -> None:
+        try:
+            await self._deleter(session_id)
+        except Exception as exc:  # 删不掉要说清原因，别静默失败
+            self._armed = ""
+            self._message = f"删除失败：{exc}"
+            self.app.invalidate()
+            return
+        self._sessions = [row for row in self._sessions if str(row["id"]) != session_id]
+        self._index = min(self._index, max(0, len(self._sessions) - 1))
+        self._armed = ""
+        if not self._sessions:
+            self._leave(None)  # 全删光了，没得挑了
+            return
+        self._message = f"已删除 …{session_id[-6:]}（还剩 {len(self._sessions)} 个）"
+        self.app.invalidate()
+
+
+async def _pick_session(
+    sessions: list[dict[str, Any]], *, deleter: Callable[[str], Awaitable[Any]]
+) -> str | None:
+    """弹出选择框让用户挑历史会话。取消（Esc）返回 None。"""
+    if not sessions:
+        return None
+    return await _SessionPicker(sessions, deleter).app.run_async()
 
 
 def format_event_plain(event: Any) -> str:
@@ -251,7 +411,7 @@ def format_event_plain(event: Any) -> str:
     """
     data = event.data
     kind = event.type.value
-    if kind == "text.delta":
+    if kind in {"text.delta", "reasoning.delta"}:
         return str(data.get("text", ""))
     if kind == "text.done":
         return ""  # 分片已经逐字打过了
@@ -265,6 +425,17 @@ def format_event_plain(event: Any) -> str:
     if kind == "error":
         return f"错误：{data.get('message')}\n"
     return ""
+
+
+def _event_line_kind(kind: str) -> str:
+    """事件类型 → 日志行类型（决定怎么上色、能不能折进"过程"组）。"""
+    if kind == "error":
+        return "error"
+    if kind == "reasoning.delta":
+        return "reason"
+    if kind in {"tool.call", "tool.result", "approval.required"}:
+        return "tool"
+    return "assistant"
 
 
 #: 界面配色。全部用 ANSI 名字而不是写死的 RGB——深浅两种终端配色都能看清。
@@ -284,26 +455,61 @@ TUI_STYLE = {
     "bar.hint": "#bb9af7",  # 回滚提示：紫
     "prompt": "#7aa2f7 bold",  # 输入提示符，跟模型名一个色系
     "user": "bold ansibrightblue",
+    # 正文写死成近白：终端默认前景色在不少深色主题里是灰的，
+    # 一眼看去跟"过程信息"（暗灰）分不开。浅色终端把这一行改成 "" 就跟随主题。
+    "assistant": "#e6e6e6",
     "tool": "ansibrightblack",  # Codex 那种暗灰：过程信息一律退到背景里去
+    "reason": "ansibrightblack italic",  # 模型自带的思考：同色系，用斜体区分
+    "warn": "#e0af68 bold",  # 需要人工确认：黄，必须显眼
     "error": "ansired bold",
-    "code": "ansibrightblack",
+    # 围栏里的内容也要用亮色：模型经常把整段正文（诗、故事、表格）放进 ``` 里，
+    # 发灰就会被误当成"过程信息"。真代码靠下面的高亮分色，注释才该退到背景里。
+    "code": "#d8dee9",
     "code.keyword": "ansibrightmagenta",
     "code.string": "ansigreen",
     "code.number": "ansibrightyellow",
     "code.comment": "ansibrightblack italic",
     "code.func": "ansicyan",
     "code.builtin": "ansibrightcyan",
-    "code.op": "",
+    "code.op": "#a7b0bd",
 }
 
 #: 日志行的类型 → 样式类。空串表示"用终端默认前景色"。
-LINE_CLASS = {"user": "class:user", "assistant": "", "tool": "class:tool", "error": "class:error"}
+LINE_CLASS = {
+    "user": "class:user",
+    "assistant": "class:assistant",
+    "tool": "class:tool",
+    "reason": "class:reason",
+    "warn": "class:warn",
+    "error": "class:error",
+}
+
+#: 归到一个"过程"组里的行类型：工具调用和模型思考都属于"过程信息"
+PROCESS_KINDS = frozenset({"tool", "reason"})
+
+
+def approval_lines(data: dict[str, Any]) -> list[str]:
+    """审批提示的几行纯文本（样式由界面统一给）。
+
+    `shell_exec` 这类单参数工具直接把命令摊开——审批的意义就是让人看清要跑什么。
+    """
+    args = data.get("args") or {}
+    detail = args.get("command") if isinstance(args, dict) else None
+    if not detail:
+        detail = json.dumps(args, ensure_ascii=False)
+    lines = [f"⚠ 需要确认：{data.get('name')}", f"  {detail}"]
+    if data.get("reason"):
+        lines.append(f"  原因：{data['reason']}")
+    lines.append("  y 放行 · 回车或 n 拒绝 · 超时按拒绝")
+    return lines
 
 
 def _group_of(kind: str) -> str:
     """把行归类，用来决定"哪里该空一行"和"哪些行能折叠到一起"。"""
     if kind.startswith("code:"):
         return "code"
+    if kind in PROCESS_KINDS:
+        return "process"
     return kind
 
 
@@ -430,6 +636,32 @@ def _fit(text: str, width: int, *, keep_tail: bool = False) -> str:
     return text + " " * max(0, width - get_cwidth(text))
 
 
+def _process_summary(run: list[tuple[str, list[tuple[str, str]]]], columns: int) -> str:
+    """折叠后那一行：**固定成一行、钉住开头**，不随流式变化。
+
+    两条都是踩出来的：
+
+    1. 别拿"最后一句思考"当进度。那样每来一个 token 这行都在变，看着像抽搐；
+       现在只露第一个思考行的开头，想看全文按 Ctrl-O。
+    2. 整行宽度必须**与终端宽度挂钩且固定**。以前它有时折成两行、有时一行，
+       行数一变，日志区的"最后几行"就整体挪位——表现就是"没人动它，屏幕自己
+       往下滚"。所以这里先把行数右对齐（`66` 和 `9` 一样宽），再按剩余宽度裁。
+    """
+    from prompt_toolkit.utils import get_cwidth
+
+    hint = "   …（Ctrl-O 展开）"
+    room = max(20, columns - get_cwidth(hint))
+    head = f"▸ 过程 {len(run):>3} 行"
+    first = ""
+    for kind, fragments in run:
+        if kind == "reason":
+            first = "".join(text for _style, text in fragments)
+            break
+    if first:
+        head += "：" + _fit(first, 36).rstrip()
+    return _fit(head, room).rstrip() + hint
+
+
 class ChatTUI:
     """全屏常驻界面：日志在界面内部滚动，状态栏 + 输入行钉在窗口最后两行。
 
@@ -446,9 +678,14 @@ class ChatTUI:
     上一版花屏正是它绕过界面直接写造成的。
     """
 
+    #: 两次真正重画之间至少隔这么久（秒）。流式输出一秒能来几百个分片，
+    #: 每个都重画会把终端刷爆——看着就像"屏幕自己在清"。
+    PAINT_INTERVAL = 0.05
+
     def __init__(self, status: ChatStatus) -> None:
         from prompt_toolkit.application import Application
         from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout import Dimension, HSplit, Layout, VSplit, Window
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -462,7 +699,20 @@ class ChatTUI:
         self._code: str | None = None  # 代码围栏的语言；None = 不在代码块里
         self._folded = True  # 过程信息（工具调用）默认折叠，跟 Codex 一样
         self._scroll = 0  # 从底部往上回滚了几屏行；0 = 跟着最新输出走
-        self.input = Buffer(multiline=False, accept_handler=self._on_accept)
+        self._frozen: list[tuple[str, str]] | None = None  # 回滚时的日志快照
+        self._frozen_pending = ""
+        self._asking = False  # 正在问"放行还是拒绝"
+        self._deferred: list[str] = []  # 打字打早了：先记着，这一轮完了再当消息发
+        self._dirty = False  # 有改动等着画
+        self._last_paint = 0.0  # 上次真正重画的时间（限流用）
+        self._trace_path = os.environ.get("AGENT_TUI_TRACE", "")
+        # 多行 + 历史。Enter 仍然发送（见下面的绑定），换行用 Ctrl-J；历史给
+        # prompt_toolkit 自带的 Ctrl-R 增量搜索用。
+        self.input = Buffer(
+            multiline=True,
+            history=InMemoryHistory(),
+            accept_handler=self._on_accept,
+        )
 
         bindings = KeyBindings()
 
@@ -491,7 +741,19 @@ class ChatTUI:
         @bindings.add("end")
         def _to_bottom(event: Any) -> None:
             self._scroll = 0
+            self._frozen = None  # 解冻：回到跟着最新输出走
+            self._frozen_pending = ""
             self.refresh()
+
+        @bindings.add("enter")
+        def _submit(event: Any) -> None:
+            # 应用级绑定比默认绑定优先级高，所以多行 Buffer 的"回车换行"被这里顶掉
+            self.input.validate_and_handle()
+
+        @bindings.add("c-j")  # Enter 发 CR、Ctrl-J 发 LF，终端层面一定分得开
+        @bindings.add("escape", "enter")
+        def _newline(event: Any) -> None:
+            self.input.insert_text("\n")
 
         @bindings.add("c-o")
         def _toggle_fold(event: Any) -> None:
@@ -520,14 +782,16 @@ class ChatTUI:
                         ),
                         VSplit(
                             [
-                                # 提示符常驻在最左边，光标钉在最后一行
+                                # 提示符常驻在最左边：平时"你 > "，问审批时换文案
                                 Window(
-                                    FormattedTextControl("› ", style="class:prompt"),
-                                    width=2,
+                                    FormattedTextControl(self._prompt_fragments),
+                                    width=6,
                                     height=1,
                                 ),
-                                Window(BufferControl(buffer=self.input), height=1),
-                            ]
+                                Window(BufferControl(buffer=self.input), height=Dimension(min=1)),
+                            ],
+                            # 多行输入最多长到 6 行，再长自己在框里滚；日志区让位
+                            height=Dimension(min=1, max=6),
                         ),
                     ]
                 )
@@ -536,6 +800,8 @@ class ChatTUI:
             style=style,
             full_screen=True,  # 备用屏幕：底栏钉在窗口最底，退出后终端复原
         )
+        if self._trace_path:
+            self._trace_erases()
 
     def _effective_pending_kind(self) -> str:
         """还在流式的那一行属于什么类型（代码块里就是代码行）。"""
@@ -543,25 +809,39 @@ class ChatTUI:
             return f"code:{self._code}"
         return self._pending_kind
 
-    def _display_items(self, limit: int) -> list[tuple[str, list[tuple[str, str]]]]:
-        """把最后 `limit` 条日志整理成"这一帧要画的行"。
+    def _view(self) -> tuple[list[tuple[str, str]], str]:
+        """这一帧该画哪份日志：跟着最新走时是实时的，回滚时是**冻结的快照**。
 
-        做两件事：换组时插一个空行（正文 / 工具 / 用户各自成段），以及把连着的
-        过程信息折成一行。只处理尾巴，所以每帧的工作量跟对话长短无关。
+        为什么要冻：滚动位置是"离底部多少行"，而底部一直在长（思考一秒几十行），
+        不冻的话你一往上滚，新输出就把视窗推着走，看着就像屏幕自己在动。
         """
-        start = max(0, len(self._log) - limit)
+        if self._frozen is not None:
+            return self._frozen, self._frozen_pending
+        return self._log, self._pending
+
+    def _build_items(
+        self,
+        start: int,
+        columns: int,
+    ) -> list[tuple[str, list[tuple[str, str]]]]:
+        """把日志从 `start` 开始整理成"要画的行"。
+
+        做两件事：换组时插空行（正文 / 工具 / 用户各自成段）、把连着的过程信息
+        折成一行（折叠后 `columns` 决定那一行裁多宽）。
+        """
+        log, pending = self._view()
         # 折叠得看到整段的开头，否则会把"延续行"当成第一行
         while (
             self._folded
             and start > 0
-            and self._log[start][0] == "tool"
-            and self._log[start - 1][0] == "tool"
+            and _group_of(log[start][0]) == "process"
+            and _group_of(log[start - 1][0]) == "process"
         ):
             start -= 1
 
         items: list[tuple[str, list[tuple[str, str]]]] = []
-        previous = _group_of(self._log[start - 1][0]) if start > 0 else None
-        for kind, text in self._log[start:]:
+        previous = _group_of(log[start - 1][0]) if start > 0 else None
+        for kind, text in log[start:]:
             if _needs_separator(items, previous, _group_of(kind)):
                 items.append(("", []))
             fragments = _line_fragments(kind, text)
@@ -570,49 +850,65 @@ class ChatTUI:
             items.append((kind, fragments))
             previous = _group_of(kind)
 
-        if self._pending:
-            kind = self._effective_pending_kind()
+        if pending:
+            # 冻结时那行是"当时"的尾巴，类型跟着快照走，用 reason 兜底（过程信息）
+            kind = self._effective_pending_kind() if self._frozen is None else "reason"
             if _needs_separator(items, previous, _group_of(kind)):
                 items.append(("", []))
-            items.append((kind, _line_fragments(kind, self._pending)))
+            items.append((kind, _line_fragments(kind, pending)))
 
-        return self._fold(items)
+        return self._fold(items, columns)
+
+    def _total_lines(self, columns: int) -> int:
+        """当前视图折行后一共有多少屏行（只算一次，滚动时用）。"""
+        total = 0
+        for _kind, fragments in self._build_items(0, columns):
+            total += len(_wrap_fragments(fragments, columns))
+        return total
 
     def _fold(
-        self, items: list[tuple[str, list[tuple[str, str]]]]
+        self, items: list[tuple[str, list[tuple[str, str]]]], columns: int
     ) -> list[tuple[str, list[tuple[str, str]]]]:
-        """折叠：连着的过程信息（工具调用）只留第一行，其余收起来。"""
+        """折叠：连着的过程信息（思考 + 工具调用）压成一行。"""
         if not self._folded:
             return items
         folded: list[tuple[str, list[tuple[str, str]]]] = []
         index = 0
         while index < len(items):
-            if items[index][0] != "tool":
+            if _group_of(items[index][0]) != "process":
                 folded.append(items[index])
                 index += 1
                 continue
             start = index
-            while index < len(items) and items[index][0] == "tool":
+            while index < len(items) and _group_of(items[index][0]) == "process":
                 index += 1
             run = items[start:index]
             if len(run) == 1:
                 folded.extend(run)
                 continue
-            first = "".join(text for _style, text in run[0][1])
-            folded.append(("tool", [("class:tool", f"{first}   …共 {len(run)} 行，Ctrl-O 展开")]))
+            folded.append(("tool", [("class:tool", _process_summary(run, columns))]))
         return folded
 
     def _render_lines(self, rows: int, columns: int) -> list[list[tuple[str, str]]]:
         """日志区这一帧要画的行（片段化），折行后取最后 (rows-2) 行。
 
-        只处理最后 (rows-2 + 回滚行数) 条**源日志**：一条源日志至少占一屏行，
-        再往前的那些一定看不见。回滚时窗口整体往上挪 `_scroll` 屏行。
+        **按屏行取，不按源日志条数取**——这是踩过的坑：折叠会把几百条思考压成
+        1 屏行，如果按"从尾部取 N 条源日志"来取窗口，窗口会整个落在那段被折叠的
+        内容里，折完只剩一行，屏幕看着就像被清空了。所以这里从尾部起取，**不够
+        就往前翻倍扩**，直到凑够一屏（或者翻到日志开头）。
         """
         height = max(1, rows - 2)  # 让出状态栏和输入行
-        wrapped: list[list[tuple[str, str]]] = []
-        for _kind, fragments in self._display_items(height + self._scroll + 1):
-            wrapped.extend(_wrap_fragments(fragments, columns))
-        end = min(len(wrapped), max(height, len(wrapped) - self._scroll))
+        log, _pending = self._view()
+        want = height + self._scroll
+        start = max(0, len(log) - (want + 1))
+        while True:
+            wrapped: list[list[tuple[str, str]]] = []
+            for _kind, fragments in self._build_items(start, columns):
+                wrapped.extend(_wrap_fragments(fragments, columns))
+            if len(wrapped) >= want or start == 0:
+                break
+            start = max(0, start - max(want + 1, len(log) - start))  # 往前翻倍
+        end = min(len(wrapped), max(0, len(wrapped) - self._scroll))
         return wrapped[max(0, end - height) : end]
 
     def _page_size(self) -> int:
@@ -620,14 +916,21 @@ class ChatTUI:
         return max(1, self.app.output.get_size().rows - 3)
 
     def _scroll_by(self, delta: int) -> None:
-        """滚动日志区。`delta > 0` 往上看历史，负数往回走；到头/到底自动夹住。"""
+        """滚动日志区。`delta > 0` 往上看历史，负数往回走；到头/到底自动夹住。
+
+        往上滚的第一下会**冻结当前内容**：之后流式输出再多，视窗也不动，
+        只在底栏上告诉你"有多少行新输出"。滚回底部（或按 End）自动解冻。
+        """
         size = self.app.output.get_size()
         height = max(1, size.rows - 2)
-        total = sum(
-            len(_wrap_fragments(fragments, size.columns))
-            for _kind, fragments in self._display_items(10_000)
-        )
-        self._scroll = min(max(0, total - height), max(0, self._scroll + delta))
+        if delta > 0 and self._frozen is None:
+            self._frozen = list(self._log)
+            self._frozen_pending = self._pending
+        limit = max(0, self._total_lines(size.columns) - height)
+        self._scroll = min(limit, max(0, self._scroll + delta))
+        if self._frozen is not None and self._scroll == 0:
+            self._frozen = None  # 回到底部了，继续跟最新
+            self._frozen_pending = ""
         self.refresh()
 
     def _transcript_fragments(self) -> list[tuple[str, str]]:
@@ -645,19 +948,35 @@ class ChatTUI:
         底色是靠 `Window(style="class:bar")` 铺满整行的，这里只管每段的前景色。
         """
         if self.status.phase:
-            lead = ("class:bar.busy", f" {self.status.spinner()} {self.status.phase} ")
+            # 等用户回话时不转圈：那会儿干活的是人，不是 agent
+            marker = "⚠" if self._asking else self.status.spinner()
+            lead = ("class:bar.busy", f" {marker} {self.status.phase} ")
         else:
             lead = ("class:bar.idle", " ● 空闲 ")
         # 徽标补到固定宽度：不然"空闲"和"执行 fs_read"一换，后面全跟着平移
         fragments = [(lead[0], _fit(lead[1], 20)), *self.status.segments(aligned=True)]
         if self._scroll:
-            fragments.append(("class:bar.hint", f" │ ↑回滚 {self._scroll} 行（End 回底）"))
+            fresh = len(self._log) - len(self._frozen) if self._frozen is not None else 0
+            hint = f" │ ↑ 浏览历史 {self._scroll} 行"
+            if fresh:
+                hint += f" · {fresh} 行新输出"
+            fragments.append(("class:bar.hint", hint + "（End 回底）"))
         return fragments
 
+    def _prompt_fragments(self) -> list[tuple[str, str]]:
+        """输入行左边那一小格：问审批的时候要换文案，宽度保持一样免得抖。"""
+        if self._asking:
+            return [("class:warn", _fit("允许? ", 6))]
+        return [("class:prompt", _fit("你 > ", 6))]
+
     def _on_accept(self, buffer: Any) -> bool:
+        """回车：把这行交给主循环，**返回 False 让 prompt_toolkit 自己清空输入框**。
+
+        它清空之前会先 `append_to_history()`——我们抢着 reset 的话，历史里记下的
+        就是空串，`Ctrl-R` 搜索等于白装。
+        """
         self._lines.put_nowait(buffer.text)
-        buffer.reset()
-        return True
+        return False
 
     def write(self, text: str, kind: str = "assistant") -> None:
         """追加日志。**不写 stdout、不走 rich**：界面自己画（见类文档）。
@@ -705,7 +1024,13 @@ class ChatTUI:
 
         上一轮的回答末尾可能没有换行（模型就这么吐的），不先收一下的话，
         `你 > ...` 会接在回答最后一行屁股后面。
+
+        顺便回到"跟着最新走"：既然你在发新消息，就该看最新那条，而不是停在
+        之前翻到的历史位置。
         """
+        self._scroll = 0
+        self._frozen = None
+        self._frozen_pending = ""
         self.end_line()
         self._push("user", f"你 > {line}")
         self.refresh()
@@ -725,10 +1050,118 @@ class ChatTUI:
             self.app.exit()
 
     def refresh(self) -> None:
+        """请求重画。**限流**，见 `PAINT_INTERVAL`。"""
+        self._dirty = True
+        self._paint()
+
+    def _paint(self, *, force: bool = False) -> None:
+        """真正把这一帧画出去（或者因为限流先攒着）。
+
+        为什么限流：思考/正文一秒能来几百个分片，每个分片都 `invalidate()` 的话，
+        终端会被持续重画——全屏下看着就是"屏幕自己在闪/在清"。攒到下一帧一起画，
+        体感一样流畅，终端负载差一个数量级。
+        """
+        now = time.monotonic()
+        if not force and now - self._last_paint < self.PAINT_INTERVAL:
+            return
+        self._last_paint = now
+        self._dirty = False
+        self._trace_frame()
         self.app.invalidate()
 
+    def tick(self) -> None:
+        """由 `_spin` 每 0.1 秒推一次：转圈 + 把攒下的改动一次性画出去。"""
+        if self.status.phase:
+            self.status.tick()
+        if self._dirty or self.status.phase:
+            self._paint(force=True)
+
+    def _trace_frame(self) -> None:
+        """排障用：`AGENT_TUI_TRACE=/tmp/tui.jsonl` 时，每画一帧记一行账。
+
+        记的是"这一屏由多少行组成"——怀疑某处在反复重排时，看这个文件就知道
+        行数到底有没有抖，不用靠猜。
+        """
+        if not self._trace_path:
+            return
+        try:
+            size = self.app.output.get_size()
+            rows = self._render_lines(size.rows, size.columns)
+            self._trace(
+                "frame",
+                rows=size.rows,
+                columns=size.columns,
+                log_lines=len(self._log),
+                pending=len(self._pending),
+                scroll=self._scroll,
+                phase=self.status.phase,
+                visible_lines=len(rows),
+            )
+        except OSError:
+            self._trace_path = ""  # 写不进去就别再试了
+
+    def _trace_erases(self) -> None:
+        """排障用：把每一次"擦屏"连调用栈一起记下来。
+
+        清屏序列只可能从 `renderer.erase()` 发出，所以这条记录能直接回答
+        "到底是谁把屏幕擦掉的"——是用户代码写终端（`patch_stdout` 那条路），
+        还是框架自己。
+        """
+        original = self.app.renderer.erase
+
+        def traced(*args: Any, **kwargs: Any) -> Any:
+            stack = [frame.function for frame in traceback.extract_stack()[-7:-1]]
+            self._trace("erase", stack=stack)
+            return original(*args, **kwargs)
+
+        self.app.renderer.erase = traced  # type: ignore[method-assign]
+
+    def _trace(self, kind: str, **fields: Any) -> None:
+        """往 `AGENT_TUI_TRACE` 追加一行 JSON。排障专用，默认关。"""
+        if not self._trace_path:
+            return
+        record = {"t": round(time.monotonic(), 3), "kind": kind, **fields}
+        try:
+            with open(self._trace_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            self._trace_path = ""
+
     async def next_line(self) -> str | None:
+        """等用户提交一行；`None` 表示 Ctrl-C / Ctrl-D。
+
+        先看 `_deferred`：那是"agent 还在干活时用户就打好的字"，被审批提问撞见后
+        先寄存在这里，等这一轮结束再按原样当消息发出去。
+        """
+        if self._deferred:
+            return self._deferred.pop(0)
         return await self._lines.get()
+
+    async def confirm(self) -> bool | None:
+        """在界面里问一句：放行还是拒绝。
+
+        返回 `True` 放行、`False` 拒绝、`None` 表示用户按了 Ctrl-C（他要走）。
+        **默认是拒绝**：直接回车、按 n、或者答非所问地打了别的内容，都不会放行；
+        打成消息的那种会先寄存起来（`_deferred`），不吞掉用户打的字。
+        """
+        self._asking = True
+        self.refresh()
+        try:
+            while True:
+                # 直接等新输入，不走 next_line()：不然刚寄存的那行会被自己再取回来
+                raw = await self._lines.get()
+                if raw is None:
+                    return None
+                answer = raw.strip().lower()
+                if answer in {"y", "yes", "是", "允许"}:
+                    return True
+                if not answer or answer in {"n", "no", "否", "拒绝"}:
+                    return False
+                self._deferred.append(raw)  # 这是用户想说的话，不是答案
+                self.write("这里是问 y/n：y 放行、回车或 n 拒绝（你那句话等这轮完再发）\n", "warn")
+        finally:
+            self._asking = False
+            self.refresh()
 
 
 @app.callback()
@@ -1175,10 +1608,58 @@ def chat(
         Path | None, typer.Option("--workspace", "-w", help="新建会话时的工作区")
     ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="自动批准所有写操作")] = False,
+    resume: Annotated[
+        bool, typer.Option("--resume", "-r", help="先列出历史会话，挑一个继续")
+    ] = False,
+    last: Annotated[
+        bool, typer.Option("--last", help="配合 --resume：直接接最近一个，不弹选择")
+    ] = False,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="列出多少条历史会话")] = 20,
 ) -> None:
     """交互式对话：一次启动、多轮问答（任务在服务端跑）。"""
     settings = Settings()
-    code = asyncio.run(_chat(server, token or settings.auth_token, session, workspace, yes))
+    code = asyncio.run(
+        _chat(
+            server,
+            token or settings.auth_token,
+            session,
+            workspace,
+            yes,
+            resume=resume,
+            last=last,
+            limit=limit,
+        )
+    )
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def resume(
+    server: Annotated[str, typer.Option("--server", help="服务端地址")] = "http://127.0.0.1:8765",
+    token: Annotated[
+        str | None, typer.Option("--token", help="访问令牌，默认取 AGENT_AUTH_TOKEN")
+    ] = None,
+    workspace: Annotated[
+        Path | None, typer.Option("--workspace", "-w", help="新建会话时的工作区")
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="自动批准所有写操作")] = False,
+    last: Annotated[bool, typer.Option("--last", help="直接接最近一个会话，不弹选择")] = False,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="列出多少条历史会话")] = 20,
+) -> None:
+    """挑一个历史会话继续聊：等价于 `agent chat --resume`。"""
+    settings = Settings()
+    code = asyncio.run(
+        _chat(
+            server,
+            token or settings.auth_token,
+            None,
+            workspace,
+            yes,
+            resume=True,
+            last=last,
+            limit=limit,
+        )
+    )
     raise typer.Exit(code=code)
 
 
@@ -1188,13 +1669,20 @@ async def _chat(
     session_id: str | None,
     workspace: Path | None,
     auto_approve: bool,
+    *,
+    resume: bool = False,
+    last: bool = False,
+    limit: int = 20,
 ) -> int:
-    import httpx
-
     from ..client.api import AgentClient
 
+    problem = tui_problem()
+    if problem:
+        console.print(f"[red]agent chat 需要真实终端：{problem}[/red]")
+        console.print('[dim]一次性的行式任务用：agent run "你的问题"（-s 接着已有会话）[/dim]')
+        return 1
+
     settings = Settings()
-    renderer = EventRenderer()
     async with AgentClient(server, token) as client:
         try:
             health = await client.health()
@@ -1204,14 +1692,27 @@ async def _chat(
             return 1
         console.print(f"[dim]已连接 {server}（agent {health.get('version')}）[/dim]")
 
+        if resume and session_id is None:
+            sessions = await client.list_sessions(limit=limit)
+            if not sessions:
+                console.print("[yellow]还没有历史会话，直接开一个新的吧[/yellow]")
+            elif last:
+                session_id = str(sessions[0]["id"])
+            else:
+                picked = await _pick_session(sessions, deleter=client.delete_session)
+                if picked is None:
+                    console.print("[dim]已取消[/dim]")
+                    return 0
+                session_id = picked
+
         if session_id is None:
             created = await client.create_session(
-                workspace=str(workspace) if workspace else None, profile="code", title="chat"
+                workspace=str(workspace) if workspace else None, profile="code"
             )
             session_id = str(created["session_id"])
             console.print(f"[dim]新会话 {session_id}｜工作区 {created['workspace']}[/dim]")
         else:
-            console.print(f"[dim]继续会话 {session_id}[/dim]")
+            console.print(f"[dim]继续会话 {session_id}（历史会先画出来）[/dim]")
         console.print("[dim]输入内容回车发送；exit / quit 退出[/dim]")
 
         status = ChatStatus(
@@ -1220,58 +1721,67 @@ async def _chat(
             session_id=session_id,
             context_limit=settings.context_limit,
         )
-        if tui_enabled():
-            await _loop_tui(client, session_id, status, auto_approve)
-            console.print("\n[dim]再见[/dim]")
-            return 0
-        ask = make_asker(status)
-        last_seq = 0
-        while True:
-            try:
-                # 故意阻塞：CLI 本来就在等用户输入（换成线程池会踩 AGENTS.md 记的坑）
-                line = (await ask()).strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            except Exception as exc:
-                # 底栏是"锦上添花"：终端不配合（老终端、奇怪的 tty、库版本差异）
-                # 就退回朴素输入，不能让一次渲染失败把整个会话带走
-                console.print(
-                    f"[yellow]底栏输入不可用（{type(exc).__name__}），已退回普通输入[/yellow]"
-                )
-                ask = make_plain_asker()
-                continue
-            if not line:
-                continue
-            if line.lower() in {"exit", "quit", ":q"}:
-                break
-
-            renderer.reset()
-            console.print("[bold]agent[/bold] ", end="")
-            try:
-                sent = await client.send_message(session_id, line)
-            except httpx.HTTPStatusError as exc:
-                console.print(
-                    f"[red]发送失败：{exc.response.status_code} {exc.response.text}[/red]"
-                )
-                continue
-            if sent.get("duplicate"):
-                console.print("[yellow]（幂等命中：这条消息已经发过了）[/yellow]")
-            turn_id = str(sent["turn_id"])
-
-            async for event in client.stream_events(session_id, after_seq=last_seq):
-                last_seq = event.seq
-                if event.type.value == "approval.required":
-                    granted = auto_approve or _ask_approval(event.data)
-                    await client.approve(
-                        session_id, str(event.data.get("call_id", "")), granted=granted
-                    )
-                    continue
-                renderer(event)
-                if event.type.value == "turn.done" and event.turn_id == turn_id:
-                    status.track(event.data.get("usage") or {})
-                    break
+        await _loop_tui(client, session_id, status, auto_approve)
         console.print("\n[dim]再见[/dim]")
     return 0
+
+
+class _TuiOutput:
+    """会话期间把 stdout/stderr 收进界面的日志区。
+
+    为什么不用 `patch_stdout()`：它把"往终端写"变成"擦屏 → 打印 → 重画"，
+    而全屏界面下这一擦就是**整屏**——只要有任何东西（库、警告、忘了关的 print）
+    写一次，用户看到的就是"屏幕闪一下/清一次"。与其要求"谁都不许写"，不如
+    把管道换掉：谁写都进界面日志（暗灰 `·` 行），终端只剩渲染器一个写者。
+    """
+
+    def __init__(self, tui: ChatTUI) -> None:
+        self._tui = tui
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                self._tui.write(f"· {line}\n", "tool")
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        raise OSError("界面对话期间没有 fileno")
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+
+class _TuiLogHandler(logging.Handler):
+    """把日志塞进界面自己的日志区。
+
+    为什么需要：`logging` 的 handler 在 `configure_logging()` 时就把**原始** stderr
+    抓在手里了，`patch_stdout()` 换不掉它——一旦有日志，它就绕过界面直接往
+    备用屏幕上写，界面被涂花/被迫整体重画（"屏幕自己在清"就有它一份）。
+    TUI 跑着的时候终端只能有一个写者，所以日志也走界面。
+    """
+
+    def __init__(self, tui: ChatTUI) -> None:
+        super().__init__(level=logging.INFO)
+        self._tui = tui
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._tui.write(f"· {record.getMessage()}\n", "tool")
+        except Exception:  # 日志出问题绝不能把会话带走
+            pass
 
 
 async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_approve: bool) -> None:
@@ -1281,16 +1791,21 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
     是状态栏 + 输入行。输出全部走 `tui.write()` 进界面缓冲区，一个字节都不写
     stdout，所以底栏**永远**在窗口最底下，跟这一轮输出了多少行无关。
 
-    `patch_stdout()` 只当保险留着：这条路自己不该有任何 stdout 写入，但库偶尔
-    会写（比如日志），让它走界面渲染器，总比直接糊在备用屏幕上好。
-    """
-    from prompt_toolkit.patch_stdout import patch_stdout
+    进来先把库里的历史画一遍（`follow=False` 拿完就断）——`-s` 和 resume 都靠它，
+    不然恢复会话是"空屏 + 等你发第一句话才哗啦倒出来"。
 
+    会话期间 `sys.stdout` / `sys.stderr` 被换成 `_TuiOutput`（写进来的东西进界面
+    日志区）：全屏下"擦屏"只可能来自有东西往终端写，把管道换掉就没人能擦了。
+    """
     tui = ChatTUI(status)
-    with patch_stdout():
+    last_seq = await _restore_backlog(tui, client, session_id)
+    # 会话期间日志也进界面：别让任何东西从旁边往备用屏幕上写
+    log_handler = _TuiLogHandler(tui)
+    logging.getLogger().addHandler(log_handler)
+    guard = _TuiOutput(tui)
+    with contextlib.redirect_stdout(guard), contextlib.redirect_stderr(guard):  # type: ignore[arg-type]
         runner = asyncio.create_task(tui.run())
         ticker = asyncio.create_task(_spin(tui))
-        last_seq = 0
         try:
             while True:
                 raw = await tui.next_line()
@@ -1312,34 +1827,38 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                     tui.refresh()
                     continue
                 turn_id = str(sent["turn_id"])
+                quitting = False
                 try:
                     async for event in client.stream_events(session_id, after_seq=last_seq):
                         last_seq = event.seq
                         kind = event.type.value
                         if kind == "approval.required":
-                            # 界面里的交互式审批还没做：目前只认 --yes，否则按拒绝
-                            tui.write(f"\n需要确认：{event.data.get('name')}（此处暂按拒绝）\n")
-                            await client.approve(
-                                session_id,
-                                str(event.data.get("call_id", "")),
-                                granted=bool(auto_approve),
+                            # 在界面上直接问：y 放行 / 回车拒绝 / Ctrl-C 连人带会话一起走
+                            granted: bool | None = (
+                                True if auto_approve else await _ask_in_tui(tui, status, event.data)
                             )
+                            try:
+                                await client.approve(
+                                    session_id,
+                                    str(event.data.get("call_id", "")),
+                                    granted=bool(granted),
+                                )
+                            except Exception as exc:  # 服务端可能已经等到超时了
+                                tui.write(f"答复没能送达服务端：{exc}\n", "error")
+                            if granted is None:
+                                quitting = True
+                                break
                             continue
                         if kind == "tool.call":
                             status.set_phase(f"执行 {event.data.get('name')}")
                         elif kind == "tool.result":
                             status.set_phase("思考中")
+                        elif kind == "reasoning.delta":
+                            status.set_phase("思考中")
                         elif kind == "text.delta":
                             status.set_phase("输出中")
                         # 过程信息（工具调用/等待确认）走暗灰并可折叠；其余是正文
-                        line_kind = (
-                            "error"
-                            if kind == "error"
-                            else "tool"
-                            if kind in {"tool.call", "tool.result", "approval.required"}
-                            else "assistant"
-                        )
-                        tui.write(format_event_plain(event), line_kind)
+                        tui.write(format_event_plain(event), _event_line_kind(kind))
                         if kind == "turn.done" and event.turn_id == turn_id:
                             status.track(event.data.get("usage") or {})
                             break
@@ -1348,30 +1867,67 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                     # 那它显示的就不是状态，是谎话
                     status.clear_phase()
                     tui.refresh()
+                if quitting:
+                    break
         finally:
             ticker.cancel()
             tui.exit()
             await asyncio.gather(runner, ticker, return_exceptions=True)
+    logging.getLogger().removeHandler(log_handler)
+
+
+async def _restore_backlog(tui: ChatTUI, client: Any, session_id: str) -> int:
+    """把库里已有的对话画进日志区，返回最后一条事件的 seq。
+
+    用 `follow=False`（服务端早就支持，回放完就断）先取一批历史：这样 `-s`
+    和 resume 进来时历史是**摆好的**，而不是空屏等你发第一句话才哗啦倒出来。
+    只看正文/思考/工具/错误——历史里的 `turn.done` 没必要再演一遍，
+    历史里的审批请求也不该在恢复时又冒出来一次。
+    """
+    last_seq = 0
+    async for event in client.stream_events(session_id, after_seq=0, follow=False):
+        last_seq = event.seq
+        kind = event.type.value
+        if kind == "turn.started":
+            prompt = str((event.data or {}).get("prompt", ""))
+            if prompt:
+                tui.echo_user(prompt)
+            continue
+        if kind in {"turn.done", "approval.required"}:
+            continue
+        text = format_event_plain(event)
+        if text:
+            tui.write(text, _event_line_kind(kind))
+    return last_seq
+
+
+async def _ask_in_tui(tui: ChatTUI, status: ChatStatus, data: dict[str, Any]) -> bool | None:
+    """把审批请求摆到界面上，等用户拍板。
+
+    返回 `True` 放行、`False` 拒绝、`None` 表示用户按了 Ctrl-C 要走。
+    """
+    for line in approval_lines(data):
+        tui.write(line + "\n", "warn")
+    status.set_phase("等待确认")
+    tui.refresh()
+    try:
+        granted = await tui.confirm()
+    finally:
+        status.set_phase("思考中")  # 这一轮还没完，别显示成空闲
+        tui.refresh()
+    tui.write("已允许\n" if granted else "已拒绝\n", "tool")
+    return granted
 
 
 async def _spin(tui: ChatTUI) -> None:
-    """执行期间让底栏逐帧转圈——它得"看着是活的"，而不是一张静止的图。
+    """每 0.1 秒推一次界面：转圈 + 把攒下的改动画出去（限流在 `ChatTUI._paint`）。
 
-    只在有阶段时刷新，空闲时一个 tick 都不发，省得白白重绘。
+    输出不再"每个分片画一帧"，而是攒到这里的节拍上——一秒最多十帧，
+    终端不会被刷爆。
     """
     while True:
         await asyncio.sleep(0.1)
-        if tui.status.phase:
-            tui.status.tick()
-            tui.refresh()
-
-
-def _ask_approval(data: Any) -> bool:
-    """终端里问一句。默认拒绝：直接回车不放行。"""
-    args = json.dumps(data.get("args", {}), ensure_ascii=False)
-    console.print(f"[dim]原因：{data.get('reason', '')}[/dim]")
-    answer = input(f"  允许执行 {args} 吗？[y/N] ").strip().lower()
-    return answer in {"y", "yes", "是"}
+        tui.tick()
 
 
 if __name__ == "__main__":
