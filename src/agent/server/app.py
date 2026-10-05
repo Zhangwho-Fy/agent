@@ -162,6 +162,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         turns = await repo.list_turns(state.db, session_id)
         return {"session": dict(row), "turns": [dict(turn) for turn in turns]}
 
+    @app.delete("/sessions/{session_id}", dependencies=[Depends(require_token)])
+    async def remove_session(session_id: str) -> dict[str, Any]:
+        """删掉一个会话，连同它的事件、消息、turn、checkpoint。
+
+        正在跑的任务不给删：那条路上还在往这个会话里写事件，删了就是半截状态。
+        """
+        await load_session(session_id)
+        runtime = state.runtimes.get(session_id)
+        if runtime is not None and runtime.lock.locked():
+            raise HTTPException(status_code=409, detail="这个会话正在跑，等它结束再删")
+        await repo.delete_session(state.db, session_id)
+        state.runtimes.pop(session_id, None)
+        return {"deleted": session_id}
+
     async def _drive(runtime: SessionRuntime, session_id: str, turn_id: str, prompt: str) -> None:
         """后台驱动一轮：同会话一把锁，结束后把结果落库。"""
         async with runtime.lock:
@@ -207,6 +221,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime = await runtime_for(session)
         turn_id = new_id("turn")
         await repo.start_turn(state.db, turn_id=turn_id, session_id=session_id)
+        # 第一句话就是标题：resume 列表里得看得出这是哪次对话
+        await repo.title_session_if_empty(state.db, session_id, body.content)
         await repo.append_message(
             state.db,
             session_id=session_id,

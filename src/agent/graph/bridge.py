@@ -101,6 +101,15 @@ async def stream_turn(
                     chunk, metadata = payload
                     if metadata.get("langgraph_node") != "agent":
                         continue  # 只要模型节点的增量，工具节点的输出另有事件
+                    # 推理模型的"思考"是**模型自带**的另一路流（DeepSeek 放在
+                    # additional_kwargs 里），我们只负责搬运，不加工、不伪造。
+                    thinking = (getattr(chunk, "additional_kwargs", None) or {}).get(
+                        "reasoning_content"
+                    )
+                    if isinstance(thinking, str) and thinking:
+                        await emitter.emit(
+                            EventType.REASONING_DELTA, {"text": thinking}, turn_id=turn_id
+                        )
                     piece = getattr(chunk, "content", "")
                     if isinstance(piece, str) and piece:
                         text_parts.append(piece)

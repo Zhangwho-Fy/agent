@@ -18,6 +18,7 @@ from .ids import new_id
 
 class EventType(StrEnum):
     TURN_STARTED = "turn.started"
+    REASONING_DELTA = "reasoning.delta"
     TEXT_DELTA = "text.delta"
     TEXT_DONE = "text.done"
     TOOL_CALL = "tool.call"

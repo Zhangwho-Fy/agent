@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from agent.core.bus import EventBus
 from agent.core.reliability import EventEmitter
@@ -80,6 +80,20 @@ async def test_model_node_calls_model_below_the_limit() -> None:
     assert update["messages"][0].content == "答案"
 
 
+async def test_reasoning_does_not_follow_the_message_into_state() -> None:
+    """思考只留事件那一份：跟着消息进状态的话，每个 superstep 都会把它重存一遍。
+
+    （不是因为会被发回模型——langchain 不转发这个字段，已验证；纯粹是别堆副本。）
+    """
+    reply = AIMessage(content="答案", additional_kwargs={"reasoning_content": "先想一下"})
+    node = build_model_node(ScriptedModel([reply]), default_registry())
+
+    update = await node({"messages": [HumanMessage(content="问")]})
+
+    assert "reasoning_content" not in update["messages"][0].additional_kwargs
+    assert update["messages"][0].content == "答案"
+
+
 async def test_tool_node_counts_tool_rounds(tmp_path: Path) -> None:
     node = build_tool_node(
         registry=default_registry(),
@@ -121,6 +135,20 @@ class RecordingGraph:
         return _EmptyStream()
 
 
+class ReasoningGraph:
+    """假图：只吐一个带 `reasoning_content` 的模型分片。
+
+    推理模型的"思考"不在 `content` 里，而是单独一路（DeepSeek 放在
+    `additional_kwargs`）。这里钉住：它要被翻译成**自己的事件**，
+    而不是混进正文的 `text.delta`。
+    """
+
+    async def astream(self, inputs: Any, config: Any = None, stream_mode: Any = None) -> Any:
+        chunk = AIMessageChunk(content="答案", additional_kwargs={"reasoning_content": "先算一下"})
+        yield "messages", (chunk, {"langgraph_node": "agent"})
+        yield "updates", {"agent": {"messages": []}}
+
+
 async def test_stream_turn_resets_counters_each_turn() -> None:
     """计数器是"这一轮用了多少次"的语义。
 
@@ -141,6 +169,28 @@ async def test_stream_turn_resets_counters_each_turn() -> None:
     assert graph.inputs is not None
     assert graph.inputs["rounds"] == 0
     assert graph.inputs["tool_rounds"] == 0
+
+
+async def test_reasoning_stream_becomes_its_own_event() -> None:
+    """模型的思考是单独一路事件，不能混进正文字里。"""
+    emitter = make_emitter()
+    events: list[Any] = []
+    emitter.on_event = events.append
+
+    await stream_turn(
+        graph=ReasoningGraph(),
+        prompt="随便问问",
+        emitter=emitter,
+        session_id="sess_test",
+        turn_id="turn_1",
+    )
+
+    kinds = [event.type.value for event in events]
+    assert "reasoning.delta" in kinds, "思考要能被客户端看见（界面里折起来显示）"
+    assert "text.delta" in kinds, "正文不受影响"
+    thinking = next(event for event in events if event.type.value == "reasoning.delta")
+    assert thinking.data["text"] == "先算一下"
+    assert thinking.turn_id == "turn_1", "事件得挂在这一轮上，客户端才好归位"
 
 
 async def test_turn_done_carries_token_usage(tmp_path: Path) -> None:

@@ -56,6 +56,11 @@ class AgentClient:
         response = await self._http.get("/sessions", params={"limit": limit})
         return list(response.raise_for_status().json()["sessions"])
 
+    async def delete_session(self, session_id: str) -> dict[str, Any]:
+        """删掉一个会话（连带它的事件、消息、turn、checkpoint）。"""
+        response = await self._http.delete(f"/sessions/{session_id}")
+        return response.raise_for_status().json()
+
     async def send_message(
         self, session_id: str, content: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
@@ -73,15 +78,23 @@ class AgentClient:
         )
         return response.raise_for_status().json()
 
-    async def stream_events(self, session_id: str, *, after_seq: int = 0) -> AsyncIterator[Event]:
+    async def stream_events(
+        self, session_id: str, *, after_seq: int = 0, follow: bool = True
+    ) -> AsyncIterator[Event]:
         """订阅会话事件流。
 
         `after_seq` 对应服务端的 `Last-Event-ID` 语义：断线重连时传上次收到的最后一个
         seq，服务端会把缺口补齐再接着推。超时设成 None——事件之间可能隔很久。
+
+        `follow=False` 只把已有事件回放一遍就结束——进 `chat -s` / resume 时先用它
+        把历史画出来，再切回跟流。
         """
         url = f"/sessions/{session_id}/events"
         async with self._http.stream(
-            "GET", url, params={"after_seq": after_seq}, timeout=None
+            "GET",
+            url,
+            params={"after_seq": after_seq, "follow": "true" if follow else "false"},
+            timeout=None,
         ) as response:
             response.raise_for_status()
             frame: dict[str, str] = {}

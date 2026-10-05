@@ -44,9 +44,45 @@ async def list_sessions(db: Database, *, limit: int = 50) -> list[sqlite3.Row]:
     return await db.all("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?", (limit,))
 
 
+#: 删会话时要一起清掉的业务表，**顺序有讲究**：SQLite 开了外键约束，
+#: 引用别人的表要先删（tool_calls 引用 turns，所以它在 turns 前面）。
+_SESSION_TABLES = ("tool_calls", "events", "messages", "idempotency", "turns")
+
+
+async def delete_session(db: Database, session_id: str) -> None:
+    """删掉一个会话，连同它的全部痕迹。
+
+    **要删全**：只删 `sessions` 一行，事件/消息/turn 就成了查不到主人的孤儿数据，
+    `agent sessions` 上看不见、库却一直涨。LangGraph 的 `checkpoints` / `writes`
+    用 `thread_id = session_id`，也一并清掉——不然删掉再建同名会话会继承旧的图状态。
+    """
+    for table in _SESSION_TABLES:
+        await db.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+    for table in ("checkpoints", "writes"):
+        try:
+            await db.execute(f"DELETE FROM {table} WHERE thread_id = ?", (session_id,))
+        except sqlite3.OperationalError:
+            pass  # 这份库还没跑过图，langgraph 的表还没建出来
+    await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
 async def touch_session(db: Database, session_id: str) -> None:
     """会话有活动时更新 `updated_at`，用于"最近会话"排序。"""
     await db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now_iso(), session_id))
+
+
+async def title_session_if_empty(db: Database, session_id: str, title: str) -> None:
+    """没标题的会话，拿第一句用户输入当标题——`agent sessions` / resume 列表靠它认人。
+
+    只在标题为空（或还是建会话时的占位符 `chat`）时写：用户后来改过的不覆盖。
+    """
+    clean = " ".join(title.split())[:60]
+    if not clean:
+        return
+    await db.execute(
+        "UPDATE sessions SET title = ? WHERE id = ? AND TRIM(title) IN ('', 'chat')",
+        (clean, session_id),
+    )
 
 
 # ---------------------------------------------------------------- events

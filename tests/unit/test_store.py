@@ -32,6 +32,37 @@ async def _new_session(database: Database, session_id: str = "sess_1") -> str:
     return session_id
 
 
+async def test_delete_session_clears_every_trace(db: Database) -> None:
+    """删会话要删全：只删 sessions 一行的话，事件/消息/turn 会变成查不到主人的孤儿。"""
+    session_id = await _new_session(db, "sess_gone")
+    await repo.append_event(db, _event(1, session_id=session_id))
+    await repo.start_turn(db, turn_id="turn_1", session_id=session_id)
+    await repo.append_message(db, session_id=session_id, seq=1, role="user", content="删我")
+    # 工具调用引用 turn：删表顺序错了会撞外键（tool_calls 得在 turns 之前删）
+    await repo.start_tool_call(
+        db,
+        call_id="call_1",
+        session_id=session_id,
+        turn_id="turn_1",
+        name="fs_read",
+        args={"path": "a.py"},
+        tier="read",
+    )
+    await repo.remember_idempotency(db, key="k1", session_id=session_id, turn_id="turn_1")
+    other = await _new_session(db, "sess_keep")
+    await repo.append_event(db, _event(1, session_id=other))
+
+    await repo.delete_session(db, session_id)
+
+    assert await repo.get_session(db, session_id) is None
+    assert await repo.list_events(db, session_id) == []
+    assert await repo.list_messages(db, session_id) == []
+    assert await repo.list_turns(db, session_id) == []
+    assert await repo.lookup_idempotency(db, "k1") is None
+    assert await repo.get_session(db, other) is not None, "别误删别的会话"
+    assert len(await repo.list_events(db, other)) == 1
+
+
 def _event(seq: int, *, session_id: str = "sess_1", text: str = "hi") -> Event:
     return Event.create(
         session_id=session_id,

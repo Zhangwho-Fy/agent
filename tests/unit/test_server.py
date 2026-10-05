@@ -404,3 +404,42 @@ async def test_messages_are_persisted_as_rows(
     assert [row["role"] for row in rows] == ["user", "assistant"]
     assert "sample.py" in rows[0]["content"]
     assert rows[1]["content"], "助手回答也要落库"
+
+    session = await repo.get_session(db, session_id)
+    assert session is not None
+    assert session["title"].startswith("sample.py"), "第一句话就是标题：resume 列表靠它认人"
+
+
+async def test_follow_false_replays_the_backlog_and_stops(
+    server: tuple[AgentClient, Any, Database],
+) -> None:
+    """`follow=false` 是"恢复历史"的地基：把已有事件放一遍就结束，不会挂在那儿等。"""
+    client, _, db = server
+    session_id = (await client.create_session())["session_id"]
+    sent = await client.send_message(session_id, "sample.py 里定义了哪几个函数？只列函数名。")
+    await wait_for_event(db, session_id, turn_done(sent["turn_id"]))
+
+    replayed = [event async for event in client.stream_events(session_id, follow=False)]
+
+    assert replayed, "得能拿到历史"
+    assert replayed[0].type is EventType.TURN_STARTED, "从第一条开始，客户端才知道整段的开头"
+    assert replayed[-1].type is EventType.TURN_DONE, "放完已有事件就收尾"
+    assert [event.seq for event in replayed] == sorted(event.seq for event in replayed)
+
+
+async def test_delete_session_removes_it_completely(
+    server: tuple[AgentClient, Any, Database],
+) -> None:
+    """删会话：列表里没了、事件也没了；再删一次是 404，不是静默成功。"""
+    client, _, db = server
+    session_id = (await client.create_session())["session_id"]
+    sent = await client.send_message(session_id, "sample.py 里定义了哪几个函数？只列函数名。")
+    await wait_for_event(db, session_id, turn_done(sent["turn_id"]))
+
+    assert await client.delete_session(session_id) == {"deleted": session_id}
+    assert [row["id"] for row in await client.list_sessions()] == []
+    assert await repo.list_events(db, session_id) == [], "事件不能留成孤儿数据"
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        await client.delete_session(session_id)
+    assert caught.value.response.status_code == 404

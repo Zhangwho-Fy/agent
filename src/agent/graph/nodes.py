@@ -28,6 +28,30 @@ from ..tools.registry import ToolRegistry
 from .state import AgentState
 
 
+def _strip_reasoning(message: Any) -> Any:
+    """摘掉消息上的 `additional_kwargs["reasoning_content"]`。
+
+    为什么摘：思考内容已经由 bridge 作为 `reasoning.delta` 事件发出去了（界面、
+    回放、录放都用那一份）。留在消息里的话，它会跟着 checkpointer 进图状态，
+    而**每个 superstep 都会把整份消息列表再存一遍**——一轮长思考就能让 checkpoint
+    多出几十 KB 的重复副本（实测一次 33 行的回答，60 个 checkpoint 里塞了约 2.6MB）。
+
+    **不是因为会被发回模型**：查过 `langchain_openai._convert_message_to_dict` 与
+    `langchain_deepseek._get_request_payload`，它们只搬 `tool_calls` / `function_call`
+    / `audio`，不会转发这个字段，所以它没有多花输入 token。纯粹是不让运行态里堆副本。
+
+    没有思考内容时原样返回（别多造对象：`add_messages` 会按 id 去重，
+    同一对象重复返回等于没追加，这条坑在 AGENTS.md 里记着）。
+    """
+    if not (getattr(message, "additional_kwargs", None) or {}).get("reasoning_content"):
+        return message
+    clean = message.model_copy(deep=True)
+    clean.additional_kwargs = {
+        key: value for key, value in clean.additional_kwargs.items() if key != "reasoning_content"
+    }
+    return clean
+
+
 def build_model_node(
     model: BaseChatModel, registry: ToolRegistry, *, max_tool_rounds: int = 12
 ) -> Any:
@@ -54,7 +78,7 @@ def build_model_node(
             }
 
         messages = [SystemMessage(content=CODE_SYSTEM_PROMPT), *state["messages"]]
-        response = await bound_model.ainvoke(messages)
+        response = _strip_reasoning(await bound_model.ainvoke(messages))
 
         usage = getattr(response, "usage_metadata", None) or {}
         previous = state.get("usage") or {}
