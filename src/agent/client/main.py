@@ -156,6 +156,118 @@ def make_asker(status: ChatStatus) -> Callable[[], Awaitable[str]]:
     return with_toolbar
 
 
+def tui_enabled() -> bool:
+    """是否启用"常驻界面"。
+
+    **默认关**。教训是：界面这种东西我这边没有真实终端可验，所以它必须是
+    opt-in——坏了你只要去掉环境变量就回到行式输出，不用改代码、不用回滚。
+
+    想试：`AGENT_CHAT_UI=tui .venv/bin/agent chat ...`
+    """
+    import os
+
+    if os.environ.get("AGENT_CHAT_UI", "").lower() != "tui":
+        return False
+    if not sys.stdout.isatty():
+        return False
+    try:
+        import prompt_toolkit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def format_event_plain(event: Any) -> str:
+    """事件 → 纯文本。
+
+    常驻界面里**不能再让 rich 插手**：它和界面渲染会抢同一块终端，
+    上次就是这么把 ANSI 序列打进正文的（屏幕上出现 `?[2m` 那种）。
+    所以这条路只产出纯文本，界面自己负责上色和布局。
+    """
+    data = event.data
+    kind = event.type.value
+    if kind == "text.delta":
+        return str(data.get("text", ""))
+    if kind == "text.done":
+        return ""  # 分片已经逐字打过了
+    if kind == "tool.call":
+        args = json.dumps(data.get("args", {}), ensure_ascii=False)
+        return f"\n→ {data.get('name')} {args}\n"
+    if kind == "tool.result":
+        return f"  ← {data.get('status')}\n"
+    if kind == "approval.required":
+        return f"\n需要确认：{data.get('name')}\n"
+    if kind == "error":
+        return f"\n错误：{data.get('message')}\n"
+    return ""
+
+
+class ChatTUI:
+    """常驻界面：日志在上、状态栏居中、输入行钉在最底。
+
+    和之前那版失败做法的根本区别：**这里没有任何东西写 stdout**。
+    日志是界面自己的缓冲区，流式 token 直接追加进去再 `invalidate()`。
+    没有 `patch_stdout`、没有 rich、没有两套渲染抢终端。
+    """
+
+    def __init__(self, status: ChatStatus) -> None:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+
+        self.status = status
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self.input = Buffer(multiline=False, accept_handler=self._on_accept)
+
+        bindings = KeyBindings()
+
+        @bindings.add("c-c")
+        @bindings.add("c-d")
+        def _quit(event: Any) -> None:
+            self._lines.put_nowait(None)
+            event.app.exit()
+
+        self.app = Application(
+            layout=Layout(
+                HSplit(
+                    [
+                        # 只占两行：状态栏 + 输入行。输出的日志**不**在这里，
+                        # 它走普通 print 往界面上方滚（由 patch_stdout 负责让位）。
+                        Window(FormattedTextControl(status.text), height=1),
+                        Window(BufferControl(buffer=self.input), height=1),
+                    ]
+                )
+            ),
+            key_bindings=bindings,
+            full_screen=False,
+        )
+
+    def _on_accept(self, buffer: Any) -> bool:
+        self._lines.put_nowait(buffer.text)
+        buffer.reset()
+        return True
+
+    def write(self, text: str) -> None:
+        """输出日志。**纯文本、不走 rich**：rich 的分片写入会和界面渲染抢终端。"""
+        if text:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    async def run(self) -> None:
+        await self.app.run_async()
+
+    def exit(self) -> None:
+        self.app.exit()
+
+    def refresh(self) -> None:
+        self.app.invalidate()
+
+    async def next_line(self) -> str | None:
+        return await self._lines.get()
+
+
 @app.callback()
 def main(
     log_level: str | None = typer.Option(None, "--log-level", help="日志级别，默认取配置里的值"),
@@ -645,6 +757,10 @@ async def _chat(
             session_id=session_id,
             context_limit=settings.context_limit,
         )
+        if tui_enabled():
+            await _loop_tui(client, session_id, status, auto_approve)
+            console.print("\n[dim]再见[/dim]")
+            return 0
         ask = make_asker(status)
         last_seq = 0
         while True:
@@ -693,6 +809,54 @@ async def _chat(
                     break
         console.print("\n[dim]再见[/dim]")
     return 0
+
+
+async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_approve: bool) -> None:
+    """常驻界面主循环。
+
+    界面只占**最底下两行**（状态栏 + 输入行）；日志走 `tui.write()` 的纯文本写，
+    由 `patch_stdout()` 负责"擦掉那两行 → 打印 → 再画回来"，
+    于是输出正常往上滚，提示符始终钉在最后一行。
+    """
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    tui = ChatTUI(status)
+    with patch_stdout():
+        runner = asyncio.create_task(tui.run())
+        last_seq = 0
+        try:
+            while True:
+                line = (await tui.next_line() or "").strip()
+                if not line:
+                    continue
+                if line.lower() in {"exit", "quit", ":q"}:
+                    break
+                tui.write(f"\n你 > {line}\n")
+                try:
+                    sent = await client.send_message(session_id, line)
+                except Exception as exc:  # 发一条消息失败不该把整个会话带走
+                    tui.write(f"发送失败：{exc}\n")
+                    continue
+                turn_id = str(sent["turn_id"])
+                async for event in client.stream_events(session_id, after_seq=last_seq):
+                    last_seq = event.seq
+                    if event.type.value == "approval.required":
+                        # 界面里的交互式审批还没做：目前只认 --yes，否则按拒绝
+                        tui.write(f"\n需要确认：{event.data.get('name')}（此处暂按拒绝）\n")
+                        await client.approve(
+                            session_id,
+                            str(event.data.get("call_id", "")),
+                            granted=bool(auto_approve),
+                        )
+                        continue
+                    tui.write(format_event_plain(event))
+                    if event.type.value == "turn.done" and event.turn_id == turn_id:
+                        status.track(event.data.get("usage") or {})
+                        tui.refresh()
+                        break
+        finally:
+            tui.exit()
+            await runner
 
 
 def _ask_approval(data: Any) -> bool:
