@@ -32,6 +32,23 @@ async def _new_session(database: Database, session_id: str = "sess_1") -> str:
     return session_id
 
 
+async def test_session_summaries_carry_the_last_user_message(db: Database) -> None:
+    """列表要认得出人：标题只记第一句（常常是"你好"），最后一句才是这次在聊什么。"""
+    session_id = await _new_session(db, "sess_a")
+    await repo.create_session(db, session_id="sess_b", profile="code", title="空会话")
+    await repo.append_message(db, session_id=session_id, seq=1, role="user", content="你好")
+    await repo.append_message(db, session_id=session_id, seq=2, role="assistant", content="在的")
+    await repo.append_message(
+        db, session_id=session_id, seq=3, role="user", content="把 README 前 5 行读出来"
+    )
+
+    by_id = {row["id"]: row for row in await repo.session_summaries(db, limit=10)}
+
+    assert by_id[session_id]["last_user"] == "把 README 前 5 行读出来", "取最后一条**用户**消息"
+    assert by_id[session_id]["turns"] == 0
+    assert by_id["sess_b"]["last_user"] is None, "一句都没说过的会话不能炸"
+
+
 async def test_delete_session_clears_every_trace(db: Database) -> None:
     """删会话要删全：只删 sessions 一行的话，事件/消息/turn 会变成查不到主人的孤儿。"""
     session_id = await _new_session(db, "sess_gone")

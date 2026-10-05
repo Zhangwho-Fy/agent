@@ -210,16 +210,18 @@ def session_choices(sessions: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """会话列表 → 选择框的条目：值取 session_id，标签是人看的那一行。
 
     标签里的每一栏都用 `_fit` 补成固定显示宽度（中文两列），所以选单是齐的。
+    第二栏是**最后一句用户消息**——标题只记第一句，常常是"你好"，认不出人。
     """
     choices: list[tuple[str, str]] = []
     for row in sessions:
         session_id = str(row.get("id", ""))
-        title = str(row.get("title") or "").strip() or "(未命名)"
+        title = " ".join(str(row.get("title") or "").split()) or "(未命名)"
+        last = " ".join(str(row.get("last_user") or "").split()) or "-"
         when = str(row.get("updated_at") or "").replace("T", " ")[:16]
         workspace = str(row.get("workspace") or "-")
         label = (
-            f"{_fit(title, 30)} │ {_fit(when, 16)} │ …{session_id[-6:]} │ "
-            f"{_fit(workspace, 24, keep_tail=True)}"
+            f"{_fit(title, 18)} │ {_fit(last, 44)} │ {_fit(when, 16)} │ "
+            f"…{session_id[-6:]} │ {_fit(workspace, 18, keep_tail=True)}"
         )
         choices.append((session_id, label))
     return choices
@@ -1431,12 +1433,15 @@ def _make_approver(auto_approve: bool) -> Any:
 @app.command()
 def sessions(
     limit: Annotated[int, typer.Option("--limit", "-n", help="最多列出多少条")] = 20,
+    as_json: Annotated[bool, typer.Option("--json", help="按 JSON 输出，给脚本用")] = False,
 ) -> None:
-    """列出最近的会话。"""
-    raise typer.Exit(code=asyncio.run(_list_sessions(Settings(), limit)))
+    """列出最近的会话：会话 id、标题、**最后一句用户消息**、最后活动、turn 数。"""
+    raise typer.Exit(code=asyncio.run(_list_sessions(Settings(), limit, as_json)))
 
 
-async def _list_sessions(settings: Settings, limit: int) -> int:
+async def _list_sessions(settings: Settings, limit: int, as_json: bool = False) -> int:
+    from rich.markup import escape
+
     from ..store import repo
     from ..store.db import Database
 
@@ -1445,19 +1450,32 @@ async def _list_sessions(settings: Settings, limit: int) -> int:
         console.print("[yellow]还没有会话库，先跑一次 `agent run`[/yellow]")
         return 0
     db.connect()
-    rows = await repo.list_sessions(db, limit=limit)
+    rows = await repo.session_summaries(db, limit=limit)
     if not rows:
         console.print("[yellow]还没有会话[/yellow]")
+        await db.close()
+        return 0
+
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False, default=str))
+        await db.close()
         return 0
 
     table = Table(title="会话")
-    table.add_column("session_id")
+    table.add_column("会话 id")
     table.add_column("标题")
+    table.add_column("最后一句")
     table.add_column("最后活动")
     table.add_column("turn 数", justify="right")
     for row in rows:
-        turns = await repo.list_turns(db, row["id"])
-        table.add_row(row["id"], row["title"] or "-", row["updated_at"], str(len(turns)))
+        last = " ".join(str(row.get("last_user") or "").split())
+        table.add_row(
+            str(row["id"]),
+            escape(str(row["title"] or "-")),  # 用户内容里可能有 `[`，别被 rich 当标记
+            escape(_fit(last, 40).rstrip() or "-"),
+            str(row["updated_at"]),
+            str(row["turns"]),
+        )
     console.print(table)
     await db.close()
     return 0

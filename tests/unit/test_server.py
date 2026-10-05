@@ -427,6 +427,23 @@ async def test_follow_false_replays_the_backlog_and_stops(
     assert [event.seq for event in replayed] == sorted(event.seq for event in replayed)
 
 
+async def test_session_list_carries_the_last_user_message(
+    server: tuple[AgentClient, Any, Database],
+) -> None:
+    """会话列表要能认人：`GET /sessions` 带上最后一句用户消息和 turn 数。"""
+    client, _, db = server
+    session_id = (await client.create_session())["session_id"]
+    question = "sample.py 里定义了哪几个函数？只列函数名。"
+    sent = await client.send_message(session_id, question)
+    await wait_for_event(db, session_id, turn_done(sent["turn_id"]))
+
+    row = next(item for item in await client.list_sessions() if item["id"] == session_id)
+
+    assert row["last_user"] == question
+    assert row["turns"] == 1
+    assert row["title"].startswith("sample.py"), "标题仍是第一句，两个字段配合着用"
+
+
 async def test_delete_session_removes_it_completely(
     server: tuple[AgentClient, Any, Database],
 ) -> None:

@@ -44,6 +44,28 @@ async def list_sessions(db: Database, *, limit: int = 50) -> list[sqlite3.Row]:
     return await db.all("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?", (limit,))
 
 
+async def session_summaries(db: Database, *, limit: int = 20) -> list[dict[str, Any]]:
+    """会话列表 + 每个会话**最后一条用户消息**（认人用）与 turn 数。
+
+    标题只记第一句（经常是"你好"），光看标题认不出哪次是哪次；最后一句通常最能
+    说明这次在聊什么。**一条 SQL 拿完**，不做 N+1 查询——列表是给人扫的，快才有人用。
+    """
+    rows = await db.all(
+        """
+        SELECT s.id, s.title, s.profile, s.workspace, s.created_at, s.updated_at,
+               (SELECT m.content FROM messages m
+                 WHERE m.session_id = s.id AND m.role = 'user'
+                 ORDER BY m.seq DESC LIMIT 1) AS last_user,
+               (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS turns
+        FROM sessions s
+        ORDER BY s.updated_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [dict(row) for row in rows]
+
+
 #: 删会话时要一起清掉的业务表，**顺序有讲究**：SQLite 开了外键约束，
 #: 引用别人的表要先删（tool_calls 引用 turns，所以它在 turns 前面）。
 _SESSION_TABLES = ("tool_calls", "events", "messages", "idempotency", "turns")

@@ -153,8 +153,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/sessions", dependencies=[Depends(require_token)])
     async def list_sessions(limit: int = 20) -> dict[str, Any]:
-        rows = await repo.list_sessions(state.db, limit=limit)
-        return {"sessions": [dict(row) for row in rows]}
+        # 带"最后一句用户消息"：客户端拿它当选择框的标签，比只有标题认得出来
+        return {"sessions": await repo.session_summaries(state.db, limit=limit)}
 
     @app.get("/sessions/{session_id}", dependencies=[Depends(require_token)])
     async def get_session(session_id: str) -> dict[str, Any]:

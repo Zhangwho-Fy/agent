@@ -524,16 +524,24 @@ def test_session_choices_are_aligned() -> None:
             {
                 "id": "sess_abcdef123456",
                 "title": "看看 builder.py",
+                "last_user": "那就把条件边那一段也读一下",
                 "updated_at": "2026-10-05T09:30:00+08:00",
                 "workspace": "/mnt/g/code/agent",
             },
-            {"id": "sess_ffffffffffffff", "title": "", "updated_at": "", "workspace": None},
+            {
+                "id": "sess_ffffffffffffff",
+                "title": "",
+                "last_user": "",
+                "updated_at": "",
+                "workspace": None,
+            },
         ]
     )
 
     assert [value for value, _label in choices] == ["sess_abcdef123456", "sess_ffffffffffffff"]
     labels = [label for _value, label in choices]
     assert "…123456" in labels[0], "只露 id 尾巴，别把整行塞满"
+    assert "那就把条件边" in labels[0], "标题常常只是第一句『你好』，最后一句才认得出人"
     assert "(未命名)" in labels[1]
     assert all("│" in label for label in labels)
     assert get_cwidth(labels[0]) == get_cwidth(labels[1]), "两行宽度得一样，选单才是齐的"
