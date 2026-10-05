@@ -13,6 +13,7 @@
 - **可重放**：`agent replay` 不调模型，把一次会话的事件流按 seq 原序还原
 - **可评测**：golden 集走回放执行，**不联网、不要密钥、几秒出通过率**
 - **服务化**：`agent serve` 提供 HTTP + SSE（任务在服务端跑，客户端只是订阅者），断线重连按 `Last-Event-ID` 补齐；`agent chat` 是配套的交互式 CLI
+- **代码检索**：切块 + FTS5 词法 + 向量语义 + RRF 混合排序，10 条查询 **recall@5 = 90%、MRR = 0.758**（离线跑，1.7 秒）
 - **CI**：每次 push 自动跑 ruff + pytest，全程不注入密钥
 
 ## 快速开始
@@ -75,7 +76,8 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 | 2 可靠性层（持久化、幂等、崩溃恢复、审批、checkpointer） | ✅ 验收已跑通 |
 | 3 工程化（录放、golden 集、CI） | ✅ |
 | 4 服务化（HTTP + SSE、断线续传、幂等、交互式 CLI） | ✅ |
-| 5 检索（RAG：切块、混合检索、recall@5 评测） | 下一步 |
+| 5 检索（切块、混合检索、recall@5 评测） | ✅ |
+| 6 扩展（MCP 适配器、可选 C++ 工具） | 下一步 |
 
 编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。详细进度与踩过的坑见 [AGENTS.md](AGENTS.md)。
 

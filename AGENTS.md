@@ -18,9 +18,10 @@
 | 阶段 2（可靠性层） | ✅ 完成，**验收已跑通**（见"已实测"③④⑤） |
 | 阶段 3（工程化） | ✅ 完成：录放 + golden 集 + CI |
 | 阶段 4（服务化） | ✅ 代码完成：`agent serve`（HTTP + SSE）、`agent chat`（交互式）、断线续传、幂等接线。socket 级 `curl` 验收待在有网络的机器上跑（见 7.2） |
-| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行；⑥ **golden 集**：3/3 通过，**3 秒、不联网、不要密钥**；⑦ 全部测试在 `AGENT_API_KEY` 为空时同样全绿（CI 场景）；⑧ **服务端**：14 个测试覆盖阶段 4 三条验收，全走 ASGI 直连 + 回放 |
-| 下一步 | 阶段 5：检索（RAG）。**开工前要先定嵌入模型**（DeepSeek 没有 embeddings 接口） |
-| 代码量 | 源码约 3600 行，测试 125 个（全绿），ruff 干净 |
+| 阶段 5（检索） | ✅ 完成：切块 + FTS5 词法 + 向量语义 + RRF 混合 + 指标评测 |
+| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行；⑥ **golden 集**：3/3 通过，**3 秒、不联网、不要密钥**；⑦ CI 上全部测试在空密钥下同样全绿；⑧ **服务端**：14 个测试覆盖阶段 4 三条验收；⑨ **检索**：10 条查询 **recall@5 = 90%、MRR = 0.758**（离线兜底嵌入，1.7 秒跑完，不联网） |
+| 下一步 | 阶段 6：扩展（MCP 适配器；C++ 工具可选） |
+| 代码量 | 源码约 4400 行，测试 136 个（全绿），ruff 干净 |
 | 语言 | **纯 Python，没有任何 C++ 代码**（C++ 是阶段 6 的可选加分项，见第 5 节第 6 条） |
 
 已跑通的实际效果：
@@ -98,6 +99,12 @@ src/agent/
 │   ├── factory.py      构建模型；按 provider 决定「真实 / 边跑边录 / 回放」
 │   └── trace.py        录放：JSONL 录制器与回放器（阶段 3）
 ├── eval.py             golden 评测集：加载用例、跑回放、判定、算通过率
+├── retrieval/          检索（阶段 5）
+│   ├── chunker.py      按行开窗切块，带重叠；遍历源码文件时先剪掉依赖目录
+│   ├── embeddings.py   嵌入接口 + 离线确定性兜底 + fastembed 后端
+│   ├── index.py        SQLite 索引：chunks 表 + FTS5(trigram) + mtime 增量
+│   ├── search.py       词法 / 语义 / RRF 混合
+│   └── metrics.py      recall@k 与 MRR
 ├── server/             服务端（阶段 4）
 │   ├── app.py          FastAPI 路由：会话、消息、SSE 事件流、审批
 │   └── runtime.py      每会话一套：模型、图、事件发射器、审批等待区
@@ -195,7 +202,34 @@ curl -N localhost:8765/sessions/$SID/events -H "Authorization: Bearer $TOKEN"   
 curl -s "localhost:8765/sessions/$SID/events?follow=false" -H "Authorization: Bearer $TOKEN"  # 只回放
 ```
 
-### 7.3 下一步：阶段 5
+### 7.3 阶段 5 做了什么（已完成）
+
+| # | 事项 | 落点 |
+| --- | --- | --- |
+| 1 | 切块 | `retrieval/chunker.py`：按行开窗 + 重叠，遍历时先剪掉 `.venv` 等目录 |
+| 2 | 索引 | `retrieval/index.py`：`chunks` 表 + `chunks_fts`（FTS5 **trigram**，中文注释才检索得到）+ 按 mtime 增量重建 |
+| 3 | 混合检索 | `retrieval/search.py`：词法（FTS5/BM25）+ 语义（余弦）+ **RRF 融合**（只看名次，不用调权重） |
+| 4 | 指标 | `retrieval/metrics.py`：recall@k、MRR；`evals/retrieval/cases.json` 10 条查询 |
+| 5 | 验收 | **recall@5 = 90%、MRR = 0.758**，1.7 秒跑完、不联网不要密钥（`pytest tests/eval -s`） |
+
+**嵌入模型这件事**：DeepSeek 没有 embeddings 接口，而沙箱里下不了权重，
+所以默认后端是 `HashingEmbedder`——**字面级匹配的确定性兜底，不是语义模型**，
+上面那两个数字只能用来做回归对比（改切块、改融合参数后看涨跌），不代表真模型效果。
+换真模型只要一步（首次运行会下模型权重）：
+
+```bash
+uv pip install fastembed
+AGENT_EMBED_BACKEND=fastembed .venv/bin/python -m pytest tests/eval -s
+```
+
+（`config.py` 里还有 `embed_backend` / `embed_model` 两个开关，默认 `offline`。）
+
+### 7.4 下一步：阶段 6
+
+1. MCP 客户端适配器：把现成的 MCP server 当工具源接进注册表
+2. （可选）C++ 工具：只在有数据支撑的性能热点处引入，且必须可降级
+3. 顺手可做的小账：把检索接成 `search_code` 工具（注册表加一项即可），
+   让 agent 自己会搜代码，而不是只会 `fs_list` + `fs_read`
 
 1. **先定嵌入模型**：DeepSeek 没有 embeddings 接口，只有两条路——本地 `bge-m3`
    （免费离线，要下几百 MB 权重）或别家 API（通义 / 硅基流动，OpenAI 兼容）
