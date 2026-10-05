@@ -20,7 +20,7 @@ import importlib.metadata
 import json
 import secrets
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -116,12 +116,27 @@ class ChatStatus:
         )
 
 
-def make_asker(status: ChatStatus) -> Callable[[], str]:
+def make_plain_asker() -> Callable[[], Awaitable[str]]:
+    """最朴素的输入：`input()`。也是底栏出问题时的退路。"""
+
+    async def plain() -> str:
+        # 故意阻塞：CLI 本来就在等用户；换成线程池会踩 AGENTS.md 记的那个坑
+        return input("\n你 > ")  # noqa: ASYNC250
+
+    return plain
+
+
+def make_asker(status: ChatStatus) -> Callable[[], Awaitable[str]]:
     """返回"读一行输入"的函数。
 
     有 `prompt_toolkit` 且确实在终端里跑，就用带底栏的输入框（输入固定在底部，
     状态栏挂在它下面）；否则退回 `input()`——重定向、CI、管道里没有 tty，
     底栏那一套根本渲染不出来，硬上只会输出一堆控制字符。
+
+    **必须是 async**：`chat` 跑在事件循环里，而 prompt_toolkit 的同步 `prompt()`
+    会自己 `asyncio.run()`，从运行中的循环里调它会直接抛
+    "asyncio.run() cannot be called from a running event loop"。异步版
+    `prompt_async()` 复用的是当前循环，没有这个问题。
 
     加依赖：`uv add prompt_toolkit`（没装也能跑，只是没有底栏）。
     """
@@ -131,16 +146,12 @@ def make_asker(status: ChatStatus) -> Callable[[], str]:
         if not sys.stdout.isatty():
             raise RuntimeError("不在终端里")
     except Exception:
-
-        def plain() -> str:
-            return input("\n你 > ")
-
-        return plain
+        return make_plain_asker()
 
     session = PromptSession()
 
-    def with_toolbar() -> str:
-        return str(session.prompt("你 > ", bottom_toolbar=status.text))
+    async def with_toolbar() -> str:
+        return str(await session.prompt_async("你 > ", bottom_toolbar=status.text))
 
     return with_toolbar
 
@@ -639,9 +650,17 @@ async def _chat(
         while True:
             try:
                 # 故意阻塞：CLI 本来就在等用户输入（换成线程池会踩 AGENTS.md 记的坑）
-                line = ask().strip()
+                line = (await ask()).strip()
             except (EOFError, KeyboardInterrupt):
                 break
+            except Exception as exc:
+                # 底栏是"锦上添花"：终端不配合（老终端、奇怪的 tty、库版本差异）
+                # 就退回朴素输入，不能让一次渲染失败把整个会话带走
+                console.print(
+                    f"[yellow]底栏输入不可用（{type(exc).__name__}），已退回普通输入[/yellow]"
+                )
+                ask = make_plain_asker()
+                continue
             if not line:
                 continue
             if line.lower() in {"exit", "quit", ":q"}:
