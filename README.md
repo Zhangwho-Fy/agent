@@ -48,7 +48,8 @@ uv run agent chat --token <令牌>    # 多轮对话，写操作会停下来问�
 | `agent sessions` | 列出最近的会话 |
 | `agent replay <会话> [--raw]` | 重放事件流，**不调模型** |
 | `agent serve` | 启动 HTTP + SSE 服务端 |
-| `agent chat [-s 会话] [--token ...]` | 交互式多轮对话（走服务端） |
+| `agent chat [-s 会话] [--token ...]` | 交互式多轮对话（全屏界面，走服务端） |
+| `agent resume [--last]` | 列出历史会话、挑一个继续（带上下文，历史先画出来；列表里 `Delete`/`d` 删会话） |
 | `agent doctor` / `agent config` / `agent version` | 环境与配置自检（不依赖 langgraph） |
 
 ## 开发
