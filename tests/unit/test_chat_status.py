@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from agent.client.main import ChatStatus, make_asker
+from agent.client.main import ChatStatus, make_plain_asker, tui_available
 
 
 def test_status_summarizes_usage_and_context() -> None:
@@ -41,9 +41,10 @@ def test_status_without_context_limit_still_reads_well() -> None:
     assert "/" not in status.text().split("上下文")[1].split("│")[0]
 
 
-def test_missing_prompt_toolkit_falls_back_to_plain_input(
+def test_no_tty_means_no_tui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """依赖没装时必须退化成 `input()`，而不是抛异常把 chat 弄挂。"""
+    """没有终端（重定向、CI、管道）时必须退回行式，否则会吐一屏控制字符。"""
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
-    assert make_asker(ChatStatus()).__name__ == "plain"
+    assert tui_available() is False
+    assert make_plain_asker().__name__ == "plain"

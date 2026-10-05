@@ -126,34 +126,82 @@ def make_plain_asker() -> Callable[[], Awaitable[str]]:
     return plain
 
 
-def make_asker(status: ChatStatus) -> Callable[[], Awaitable[str]]:
-    """返回"读一行输入"的函数。
+def tui_available() -> bool:
+    """有 prompt_toolkit **且**确实在终端里，才用常驻界面。
 
-    有 `prompt_toolkit` 且确实在终端里跑，就用带底栏的输入框（输入固定在底部，
-    状态栏挂在它下面）；否则退回 `input()`——重定向、CI、管道里没有 tty，
-    底栏那一套根本渲染不出来，硬上只会输出一堆控制字符。
-
-    **必须是 async**：`chat` 跑在事件循环里，而 prompt_toolkit 的同步 `prompt()`
-    会自己 `asyncio.run()`，从运行中的循环里调它会直接抛
-    "asyncio.run() cannot be called from a running event loop"。异步版
-    `prompt_async()` 复用的是当前循环，没有这个问题。
-
-    加依赖：`uv add prompt_toolkit`（没装也能跑，只是没有底栏）。
+    重定向、CI、管道里没有 tty，界面那一套渲染不出来，硬上只会吐一堆控制字符，
+    所以那种情况一律退回朴素的行式输入。
     """
+    if not sys.stdout.isatty():
+        return False
     try:
-        from prompt_toolkit import PromptSession
+        import prompt_toolkit  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
-        if not sys.stdout.isatty():
-            raise RuntimeError("不在终端里")
-    except Exception:
-        return make_plain_asker()
 
-    session = PromptSession()
+class ChatTUI:
+    """常驻界面：日志在上方滚动，**状态栏和输入行一直钉在最底**。
 
-    async def with_toolbar() -> str:
-        return str(await session.prompt_async("你 > ", bottom_toolbar=status.text))
+    为什么不用 `PromptSession`：它的底栏只在"等输入"期间存在，一敲回车 app 就退出，
+    执行期间状态栏整段消失。要常驻就得自己拿 `Application` 管最底下那两行，
+    再配 `patch_stdout()`——普通 `print` 会被它变成"擦掉界面 → 打印 → 重画界面"，
+    于是日志在上方累积、状态栏和输入行始终留在底部。
+    """
 
-    return with_toolbar
+    def __init__(self, status: ChatStatus) -> None:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+
+        self.status = status
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self.buffer = Buffer(multiline=False, accept_handler=self._on_accept)
+
+        bindings = KeyBindings()
+
+        @bindings.add("c-c")
+        @bindings.add("c-d")
+        def _quit(event: Any) -> None:
+            self._lines.put_nowait(None)  # None 表示"用户要走"
+            event.app.exit()
+
+        self.app = Application(
+            layout=Layout(
+                HSplit(
+                    [
+                        Window(content=FormattedTextControl(status.text), height=1),
+                        Window(content=BufferControl(buffer=self.buffer)),
+                    ]
+                )
+            ),
+            key_bindings=bindings,
+            full_screen=False,
+        )
+
+    def _on_accept(self, buffer: Any) -> bool:
+        """回车：把这一行交给主循环，并清空输入行。"""
+        text = buffer.text
+        buffer.reset()
+        self._lines.put_nowait(text)
+        return True
+
+    async def run(self) -> None:
+        await self.app.run_async()
+
+    def exit(self) -> None:
+        self.app.exit()
+
+    def refresh(self) -> None:
+        """状态栏数字变了，让界面重画一次。"""
+        self.app.invalidate()
+
+    async def next_line(self) -> str | None:
+        """等用户提交一行；返回 None 表示 Ctrl-C / Ctrl-D。"""
+        return await self._lines.get()
 
 
 @app.callback()
@@ -614,12 +662,9 @@ async def _chat(
     workspace: Path | None,
     auto_approve: bool,
 ) -> int:
-    import httpx
-
     from ..client.api import AgentClient
 
     settings = Settings()
-    renderer = EventRenderer()
     async with AgentClient(server, token) as client:
         try:
             health = await client.health()
@@ -645,54 +690,110 @@ async def _chat(
             session_id=session_id,
             context_limit=settings.context_limit,
         )
-        ask = make_asker(status)
-        last_seq = 0
-        while True:
-            try:
-                # 故意阻塞：CLI 本来就在等用户输入（换成线程池会踩 AGENTS.md 记的坑）
-                line = (await ask()).strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            except Exception as exc:
-                # 底栏是"锦上添花"：终端不配合（老终端、奇怪的 tty、库版本差异）
-                # 就退回朴素输入，不能让一次渲染失败把整个会话带走
-                console.print(
-                    f"[yellow]底栏输入不可用（{type(exc).__name__}），已退回普通输入[/yellow]"
-                )
-                ask = make_plain_asker()
-                continue
-            if not line:
-                continue
-            if line.lower() in {"exit", "quit", ":q"}:
-                break
-
-            renderer.reset()
-            console.print("[bold]agent[/bold] ", end="")
-            try:
-                sent = await client.send_message(session_id, line)
-            except httpx.HTTPStatusError as exc:
-                console.print(
-                    f"[red]发送失败：{exc.response.status_code} {exc.response.text}[/red]"
-                )
-                continue
-            if sent.get("duplicate"):
-                console.print("[yellow]（幂等命中：这条消息已经发过了）[/yellow]")
-            turn_id = str(sent["turn_id"])
-
-            async for event in client.stream_events(session_id, after_seq=last_seq):
-                last_seq = event.seq
-                if event.type.value == "approval.required":
-                    granted = auto_approve or _ask_approval(event.data)
-                    await client.approve(
-                        session_id, str(event.data.get("call_id", "")), granted=granted
-                    )
-                    continue
-                renderer(event)
-                if event.type.value == "turn.done" and event.turn_id == turn_id:
-                    status.track(event.data.get("usage") or {})
-                    break
-        console.print("\n[dim]再见[/dim]")
+        try:
+            if tui_available():
+                await _loop_tui(client, session_id, status, auto_approve)
+            else:
+                await _loop_plain(client, session_id, status, auto_approve)
+        finally:
+            console.print("\n[dim]再见[/dim]")
     return 0
+
+
+async def _run_one_turn(
+    client: Any,
+    session_id: str,
+    line: str,
+    *,
+    last_seq: int,
+    renderer: EventRenderer,
+    status: ChatStatus,
+    auto_approve: bool,
+    refresh: Callable[[], None] | None = None,
+) -> int:
+    """发一条消息、把这一轮的事件渲染完，返回新的 `last_seq`。两个循环共用。"""
+    import httpx
+
+    renderer.reset()
+    console.print("[bold]agent[/bold] ", end="")
+    try:
+        sent = await client.send_message(session_id, line)
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]发送失败：{exc.response.status_code} {exc.response.text}[/red]")
+        return last_seq
+    if sent.get("duplicate"):
+        console.print("[yellow]（幂等命中：这条消息已经发过了）[/yellow]")
+    turn_id = str(sent["turn_id"])
+
+    async for event in client.stream_events(session_id, after_seq=last_seq):
+        last_seq = event.seq
+        if event.type.value == "approval.required":
+            granted = auto_approve or _ask_approval(event.data)
+            await client.approve(session_id, str(event.data.get("call_id", "")), granted=granted)
+            continue
+        renderer(event)
+        if event.type.value == "turn.done" and event.turn_id == turn_id:
+            status.track(event.data.get("usage") or {})
+            if refresh is not None:
+                refresh()
+            break
+    return last_seq
+
+
+async def _loop_plain(client: Any, session_id: str, status: ChatStatus, auto_approve: bool) -> None:
+    """没有终端（或没装 prompt_toolkit）时的行式循环。"""
+    renderer = EventRenderer()
+    ask = make_plain_asker()
+    last_seq = 0
+    while True:
+        try:
+            line = (await ask()).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            continue
+        if line.lower() in {"exit", "quit", ":q"}:
+            break
+        last_seq = await _run_one_turn(
+            client,
+            session_id,
+            line,
+            last_seq=last_seq,
+            renderer=renderer,
+            status=status,
+            auto_approve=auto_approve,
+        )
+
+
+async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_approve: bool) -> None:
+    """常驻界面：状态栏和输入行一直在最底，日志往上方滚。"""
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    renderer = EventRenderer()
+    tui = ChatTUI(status)
+    with patch_stdout():
+        runner = asyncio.create_task(tui.run())
+        last_seq = 0
+        try:
+            while True:
+                line = (await tui.next_line() or "").strip()
+                if not line:
+                    continue
+                if line.lower() in {"exit", "quit", ":q"}:
+                    break
+                last_seq = await _run_one_turn(
+                    client,
+                    session_id,
+                    line,
+                    last_seq=last_seq,
+                    renderer=renderer,
+                    status=status,
+                    auto_approve=auto_approve,
+                    refresh=tui.refresh,
+                )
+        finally:
+            tui.exit()
+            await runner
 
 
 def _ask_approval(data: Any) -> bool:
