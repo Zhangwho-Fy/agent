@@ -1,0 +1,15 @@
+{
+  "root": "src/agent",
+  "cases": [
+    { "query": "审批为什么要单独一个节点", "expected": ["graph/nodes.py"] },
+    { "query": "事件必须先落库再推送", "expected": ["core/events.py"] },
+    { "query": "resolve_within 路径边界", "expected": ["tools/base.py"] },
+    { "query": "崩溃恢复把没跑完的 turn 标成什么", "expected": ["store/repo.py"] },
+    { "query": "断线续传 补齐缺口 seq", "expected": ["server/app.py"] },
+    { "query": "工具输出太长怎么截断", "expected": ["tools/base.py"] },
+    { "query": "幂等键 重复执行", "expected": ["store/repo.py", "server/app.py"] },
+    { "query": "回放模型 严格按顺序", "expected": ["models/trace.py"] },
+    { "query": "检查点 恢复时从头重跑", "expected": ["graph/nodes.py", "graph/checkpointer.py"] },
+    { "query": "环境变量白名单 密钥泄漏", "expected": ["tools/shell.py"] }
+  ]
+}
