@@ -257,6 +257,24 @@ AGENT_EMBED_BACKEND=fastembed .venv/bin/python -m pytest tests/eval -s
 | 带鉴权的接口全部挂住，`/health` 却正常 | FastAPI 把**同步**依赖（`def`）丢进线程池执行，撞上"线程池任务交接失败"那条限制——同一个根因第三次踩（前两次：LangGraph 同步可调用对象、`asyncio.to_thread`） | 框架会把可调用对象丢线程池的地方，一律写成 `async def`：FastAPI 依赖、LangGraph 节点与条件边、路由函数。`server/app.py` 的 `require_token` 有注释 |
 | 本地测试全绿，CI 一上来全挂：读不到评测夹具 | `.gitignore` 里的 `traces/`（本意是忽略运行产物）把 `evals/traces/` 一起吞了，文件只存在本机、没进仓库；而 **CI 机器上只有仓库里的东西** | 夹具目录改名成 `evals/recordings/` 避开这条规则，`.gitignore` 里也留了警告；另加 `test_fixtures_are_tracked_by_git`，用 `git ls-files` 在本地就把"没提交"揪出来 |
 | 每次运行要等 30 秒以上，且前 30 秒屏幕上没有任何输出 | 代码和 `.venv` 都在 Windows 盘（`/mnt/g`，9p 挂载）。`agent run` 要读 3885 个 `.py` 文件，跨文件系统每次读都是往返。实测：`import openai` 从 `/mnt/g` 要 12.8s，从 Linux 侧只要 1.6s | `.venv` 移到 Linux 文件系统，原位置留软链接（`.gitignore` 里的规则写成 `.venv` 不带斜杠，否则软链接匹配不到）。`agent version` 从十几秒降到 1 秒 |
+| 交互界面花屏：正文里出现 `?[2m` 这类字符、状态栏文字混进输出 | **rich 和 prompt_toolkit 抢同一块终端**。rich 的分片写入（`console.print(..., end="")`）被界面重绘打断，ANSI 序列没被终端解释，当成普通字符打了出来 | **同一时刻只能有一套东西写终端**。TUI 模式下输出改走纯文本（`format_event_plain`），rich 完全不参与；代价是 TUI 里暂时没有颜色 |
+
+### 7.5 待办：`agent chat` 的常驻底栏（进行中）
+
+目标是 Codex 那种手感：**提示符钉在最后一行、状态栏常驻、执行期间也不消失**。
+
+- **现状**：`ChatTUI`（`src/agent/client/main.py`）已就位，**由开关控制**——
+  `AGENT_CHAT_UI=tui` 才启用，默认仍是行式输出。踩过坑之后刻意这么做：
+  界面代码坏了，用户去掉环境变量就能回到稳的路，不用改代码、不用回滚。
+- **已做到**：界面只占最底下两行（状态栏 + 输入行）；日志用纯文本往上滚，
+  由 `patch_stdout()` 负责"擦掉两行 → 打印 → 画回来"。
+- **已验证**：能跑（用户实测）、139 个测试全绿、默认路径行为不变。
+- **待做**：① TUI 里的交互式审批（现在只认 `-y`，否则按拒绝）；
+  ② 颜色（TUI 路径目前是纯文本）；③ 多行输入、历史搜索这类细节。
+- **改这里的注意事项**（都是踩出来的）：
+  1. **别让 rich 和界面同时写终端**——上一版就是这么花屏的；
+  2. 沙箱里**没有 tty**，改完自己验不了，必须让用户在真实终端跑一次；
+  3. 保持 opt-in，别把默认路径弄坏。
 
 ## 9. 协作约定
 
