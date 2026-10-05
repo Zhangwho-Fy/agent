@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     model: str = "deepseek-v4-flash"
     base_url: str = "https://api.deepseek.com"
     api_key: str = Field(default="", description="模型服务密钥，只从环境读取，绝不入库")
+    trace_path: Path | None = Field(
+        default=None,
+        description=(
+            "录放文件（JSONL）。provider=deepseek 时作为录制目标，provider=replay 时作为回放来源"
+        ),
+    )
 
     # ---- 工作区与执行限制 ----
     workspace: Path = Field(default=Path("."), description="code profile 的工作区根目录")

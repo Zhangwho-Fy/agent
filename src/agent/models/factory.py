@@ -2,6 +2,12 @@
 
 只做一件事：把 `Settings` 翻译成 LangChain 的模型对象。单独一层的理由——
 测试里要换成回放模型、阶段 3 要在这里挂录制包装，而图本身不该知道差别。
+
+三种组合：
+
+- `provider=deepseek`，无 `trace_path` → 直接真实调用
+- `provider=deepseek`，有 `trace_path` → 真实调用 + **边跑边录**
+- `provider=replay`，有 `trace_path` → 只回放，不联网、不要密钥
 """
 
 from __future__ import annotations
@@ -14,9 +20,30 @@ from ..config import Settings
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
+    if settings.provider == "replay":
+        return _build_replay(settings)
     if settings.provider == "deepseek":
-        return _build_deepseek(settings)
+        model = _build_deepseek(settings)
+        if settings.trace_path is None:
+            return model
+        from .trace import RecordingChatModel, TraceRecorder
+
+        return RecordingChatModel(
+            inner=model,
+            recorder=TraceRecorder(path=settings.trace_path),
+            model_name=settings.model,
+        )
     raise ValueError(f"暂不支持的 provider：{settings.provider}")
+
+
+def _build_replay(settings: Settings) -> BaseChatModel:
+    from .trace import ReplayChatModel, TracePlayer
+
+    if settings.trace_path is None:
+        msg = "provider=replay 需要 AGENT_TRACE_PATH 指向一份录制文件"
+        raise ValueError(msg)
+    player = TracePlayer.from_file(settings.trace_path)
+    return ReplayChatModel(player=player, model_name=f"replay:{settings.trace_path.name}")
 
 
 def _build_deepseek(settings: Settings) -> BaseChatModel:
