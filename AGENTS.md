@@ -16,9 +16,10 @@
 | 阶段 0（设计） | ✅ 完成 |
 | 阶段 1（最小闭环） | ✅ 代码完成，**4/4 条验收已验证** |
 | 阶段 2（可靠性层） | ✅ 完成，**验收已跑通**（见"已实测"③④⑤） |
-| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行（`tests/unit/test_approval.py` 钉住） |
-| 下一步 | 阶段 3：录放、golden 评测集、CI |
-| 代码量 | 源码约 2700 行，测试 104 个（全绿），ruff 干净 |
+| 阶段 3（工程化） | ✅ 完成：录放 + golden 集 + CI |
+| 已实测 | ① 流式逐 token：691 字符的回答产生 399 个 `text.delta`，跨度 0.913s，与直连 SDK 的 0.901s 一致；② 工具报错自愈：故意读错路径 → 模型自己 `fs_list` → `find` 定位 → 读到正确文件；③ **崩溃恢复**：跑到一半 `kill -9`，重启后打出"恢复：1 个没跑完的 turn 已标记为 interrupted"，同会话续跑并答对了上文相关问题；④ **重放**：`agent replay <会话>` 不调模型，把 223 条事件按 seq 原序还原；⑤ **审批**：没通道 / 被拒 / 超时三种情况都不放行（`tests/unit/test_approval.py` 钉住）；⑥ **golden 集**：3/3 通过，**3 秒跑完、不联网、不要密钥**；⑦ 110 个测试在 `AGENT_API_KEY` 为空时同样全绿（CI 场景） |
+| 下一步 | 阶段 4：服务化（HTTP + SSE + 协议冻结）；交互式 `agent chat` 也放在这里 |
+| 代码量 | 源码约 3000 行，测试 110 个（全绿），ruff 干净 |
 | 语言 | **纯 Python，没有任何 C++ 代码**（C++ 是阶段 6 的可选加分项，见第 5 节第 6 条） |
 
 已跑通的实际效果：
@@ -63,6 +64,9 @@ rm -f uv.lock && uv sync --default-index https://mirrors.aliyun.com/pypi/simple/
 | `.venv/bin/agent run -s <会话> "任务"` | 接着已有会话跑（checkpointer 会带上历史） |
 | `.venv/bin/agent sessions` | 列出最近的会话 |
 | `.venv/bin/agent replay <会话> [--raw]` | 按原序重放事件流，**不调模型**（`--raw` 看逐条分片） |
+| `AGENT_TRACE_PATH=x.jsonl agent run ...` | 边跑边把模型调用录成夹具（阶段 3） |
+| `AGENT_PROVIDER=replay AGENT_TRACE_PATH=x.jsonl agent run ...` | 用录制文件离线跑，不联网 |
+| `.venv/bin/python -m pytest tests/eval -s` | 跑 golden 集并打印通过率（不联网、不要密钥） |
 | `.venv/bin/python -m pytest -q` | 全量测试（**不需要联网、不需要 key**） |
 | `.venv/bin/ruff check . && .venv/bin/ruff format --check .` | 静态检查，提交前必须过 |
 | `.venv/bin/python scripts/smoke_api.py` | 模型连通性烟测（真实调用，手动跑） |
@@ -87,7 +91,10 @@ src/agent/
 │   ├── messages.py     消息/工具调用模型
 │   ├── tool_spec.py    工具契约 + 工具名校验（协议只允许 [A-Za-z0-9_-]）
 │   └── errors.py       异常层次
-├── models/factory.py   构建 ChatDeepSeek（换供应商改这里）
+├── models/
+│   ├── factory.py      构建模型；按 provider 决定「真实 / 边跑边录 / 回放」
+│   └── trace.py        录放：JSONL 录制器与回放器（阶段 3）
+├── eval.py             golden 评测集：加载用例、跑回放、判定、算通过率
 ├── tools/
 │   ├── base.py         ToolContext/ToolResult、工作区路径边界、输出截断
 │   ├── fs.py           fs_read / fs_list
@@ -98,7 +105,10 @@ src/agent/
 │   ├── schema.sql      六张表的建表语句（events 是事实源，messages 是投影）
 │   ├── db.py           Database：连接、WAL、串行化访问
 │   └── repo.py         各表读写：seq 分配、按 seq 补事件、崩溃恢复标记……
-└── client/main.py      CLI：run / doctor / config / version
+└── client/main.py      CLI：version / doctor / config / run / sessions / replay
+
+evals/                  golden 用例（cases/）、夹具工作区（workspaces/）、录制文件（traces/）
+.github/workflows/ci.yml  CI：uv sync + ruff + pytest，全程不注入密钥
 ```
 
 ## 5. 五条设计决定（别走回头路）
@@ -134,12 +144,33 @@ src/agent/
 | 5 | 崩溃恢复 | `repo.interrupt_running_turns()`，CLI 启动时调用 |
 | 6 | 验收 | `agent run` / `kill -9` / `--session` 续跑 / `agent replay` 四步已实测 |
 
-### 7.1 下一步：阶段 3
+### 7.1 阶段 3 做了什么（已完成）
 
-1. **录放**：自定义 `BaseChatModel` 做录制与回放（录成 JSONL），目标是**不设置 API key 也能跑全流程**，CI 不需要密钥
-2. **golden 评测集**：固定任务集 + `pytest eval` 输出通过率
-3. **CI**：pytest + ruff 的绿色构建，缓存 uv 依赖
-4. 验收：`pytest` 全绿；`pytest eval` 输出通过率；不设置 key 也能跑回放
+| # | 事项 | 落点 |
+| --- | --- | --- |
+| 1 | 录放 | `models/trace.py`（`RecordingChatModel` / `ReplayChatModel` / JSONL 读写），`models/factory.py` 按 provider 分流 |
+| 2 | golden 集 | `eval.py`（加载用例 + 判定 + 通过率）、`evals/cases/*.json`、`evals/workspaces/`、`evals/traces/*.jsonl` |
+| 3 | CI | `.github/workflows/ci.yml`：`uv sync --frozen` → ruff → pytest，**不注入任何密钥** |
+| 4 | 验收 | golden 3/3；110 个测试在空密钥下全绿 |
+
+录放的三种用法：
+
+```bash
+# 录：真实调用，同时把每次 (请求, 响应) 追加到 JSONL
+AGENT_TRACE_PATH=evals/traces/xxx.jsonl .venv/bin/agent run "任务"
+# 放：完全离线，不联网不要密钥
+AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/traces/xxx.jsonl .venv/bin/agent run "任务"
+# 评测：跑 golden 集并打印通过率
+.venv/bin/python -m pytest tests/eval -s
+```
+
+### 7.2 下一步：阶段 4
+
+1. `agent serve`：FastAPI + SSE，让 CLI 从"直接驱动图"改成"订阅事件流"
+2. 断线续传：`Last-Event-ID` → `repo.list_events(after_seq=...)`（存储层已就绪，缺接线）
+3. 幂等：客户端重发同一条消息时用 `idempotency` 表挡住（表和读写函数已就绪，缺接线）
+4. 交互式 CLI（`agent chat`）：一次启动多轮对话，把启动开销从"每轮都付"降到"只付一次"
+5. 协议冻结 → `docs/protocol.md`
 
 ## 8. 已知坑（现象 → 原因 → 做法）
 
@@ -157,6 +188,7 @@ src/agent/
 | 整个进程静默卡死，不报错也不占 CPU（`asyncio.to_thread` 相关） | 受限容器里，把阻塞调用丢进线程池后，工作线程**反向唤醒事件循环**这一步会失败。判据：`to_thread` 里跑 `time.sleep` / 写文件 / 任何 sqlite 语句都挂住，换成手写 `threading.Thread` 就正常——差别只在要不要唤醒事件循环 | 别用 `to_thread` 包装阻塞调用。数据库这类"单条语句微秒级"的操作直接在事件循环里同步执行（`store/db.py` 就是这么做并写明了理由）；真要异步 IO 就找原生异步驱动 |
 | 一接 checkpointer 就卡死 | 官方 `AsyncSqliteSaver` 基于 `aiosqlite`，而 aiosqlite 用后台线程 + 事件循环回调，撞上的是同一条限制 | 用同步 `SqliteSaver`（它的逻辑本来就在当前线程），只补一层把异步方法接到同步实现的薄适配：`graph/checkpointer.py` |
 | 审批通过后工具被执行了两遍 / 事件重复推送 | `interrupt()` 挂起的节点，**恢复时会从头重跑**。挂起点和副作用放在同一个节点里，重跑就会重复执行、重复发事件 | 把"会挂起"的部分拆成独立的**纯计算**节点（本项目是 `approve`）：它只做分级判断，一个事件都不发；执行留在永远不会挂起的 `tools` 节点。`tests/unit/test_approval.py` 钉住 |
+| 录一遍再放一遍，结果对不上 | 评测夹具用了**会变的目录**：录制文件写在被 `fs_list` 的工作区里，第二次跑时文件大小变了，工具输出自然不同 | 夹具工作区要独立且稳定（`evals/workspaces/<id>/`），录制文件、临时文件一律放工作区**外面**。`tests/unit/test_trace.py` 的注释里记着这条 |
 | 每次运行要等 30 秒以上，且前 30 秒屏幕上没有任何输出 | 代码和 `.venv` 都在 Windows 盘（`/mnt/g`，9p 挂载）。`agent run` 要读 3885 个 `.py` 文件，跨文件系统每次读都是往返。实测：`import openai` 从 `/mnt/g` 要 12.8s，从 Linux 侧只要 1.6s | `.venv` 移到 Linux 文件系统，原位置留软链接（`.gitignore` 里的规则写成 `.venv` 不带斜杠，否则软链接匹配不到）。`agent version` 从十几秒降到 1 秒 |
 
 ## 9. 协作约定
