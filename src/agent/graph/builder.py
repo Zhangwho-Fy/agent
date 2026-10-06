@@ -19,6 +19,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
+from ..core.prompt import render_system_prompt
 from ..core.reliability import EventEmitter
 from ..store.db import Database
 from ..tools.base import ToolContext
@@ -56,7 +57,17 @@ def build_graph(
     所以要用审批流就必须接上它。`db` 用来记工具调用审计，可以不传。
     """
     builder = StateGraph(AgentState)
-    builder.add_node("agent", build_model_node(model, registry, max_tool_rounds=max_tool_rounds))
+
+    def _system_prompt() -> str:
+        """每次模型调用现拼（L1 + L2）。传函数而不是字符串：技能目录会随会话变化（D11）。"""
+        return render_system_prompt(workspace=ctx.workspace, tool_names=registry.names)
+
+    builder.add_node(
+        "agent",
+        build_model_node(
+            model, registry, system_prompt=_system_prompt, max_tool_rounds=max_tool_rounds
+        ),
+    )
     builder.add_node("approve", build_approval_node(registry, policy))
     builder.add_node(
         "tools",

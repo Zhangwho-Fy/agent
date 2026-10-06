@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -18,7 +20,8 @@ from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMe
 from langgraph.types import interrupt
 
 from ..core.events import EventType
-from ..core.prompt import CODE_SYSTEM_PROMPT
+from ..core.guard import scan_suspicious, wrap_untrusted
+from ..core.prompt import STATIC_CORE
 from ..core.reliability import EventEmitter
 from ..store import repo
 from ..store.db import Database
@@ -26,6 +29,8 @@ from ..tools.base import ToolContext
 from ..tools.policy import Decision, Policy, PolicyDecision
 from ..tools.registry import ToolRegistry
 from .state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_reasoning(message: Any) -> Any:
@@ -53,9 +58,16 @@ def _strip_reasoning(message: Any) -> Any:
 
 
 def build_model_node(
-    model: BaseChatModel, registry: ToolRegistry, *, max_tool_rounds: int = 12
+    model: BaseChatModel,
+    registry: ToolRegistry,
+    *,
+    system_prompt: str | Callable[[], str] | None = None,
+    max_tool_rounds: int = 12,
 ) -> Any:
     """模型节点：把工具清单绑给模型，收到回复就追加进状态。
+
+    `system_prompt` 允许传一个**可调用对象**，不是洁癖：技能目录会在一轮结束时刷新
+    （D11），而每次模型调用都要拿到当期的那一份。传字符串则固定不变。
 
     **循环上限在这里兜底**：工具往返次数用尽后不再调用模型，直接给一条收尾消息——
     它没有 `tool_calls`，条件边 `_route` 看到就会走到 END，循环停住。
@@ -63,6 +75,11 @@ def build_model_node(
     一次往返算 2 步），换算关系藏在框架里；这里数的是"工具往返次数"，和配置项同名同义。
     """
     bound_model = model.bind_tools(registry.to_openai_tools())
+
+    def system_message_text() -> str:
+        if system_prompt is None:
+            return STATIC_CORE  # 没给环境信息时退化成 L1；测试与嵌入式用法走这条
+        return system_prompt() if callable(system_prompt) else system_prompt
 
     async def call_model(state: AgentState) -> dict[str, Any]:
         if (state.get("tool_rounds") or 0) >= max_tool_rounds:
@@ -77,7 +94,7 @@ def build_model_node(
                 ]
             }
 
-        messages = [SystemMessage(content=CODE_SYSTEM_PROMPT), *state["messages"]]
+        messages = [SystemMessage(content=system_message_text()), *state["messages"]]
         response = _strip_reasoning(await bound_model.ainvoke(messages))
 
         usage = getattr(response, "usage_metadata", None) or {}
@@ -219,7 +236,19 @@ def build_tool_node(
                 continue
 
             result = await tool.run(args, ctx)
-            results.append(ToolMessage(content=result.content, tool_call_id=call_id))
+            # 外部内容统一打上来源标记：工具结果一律当**数据**看（guard 模块文档）。
+            # 命中的可疑模式只作为属性记录，不改内容、不拦截。
+            flagged = scan_suspicious(result.content)
+            detail = {key: args[key] for key in ("path", "cwd") if isinstance(args.get(key), str)}
+            content = wrap_untrusted(
+                result.content,
+                source=name,
+                suspicious=",".join(flagged) if flagged else None,
+                **detail,
+            )
+            results.append(ToolMessage(content=content, tool_call_id=call_id))
+            if flagged:
+                logger.warning("工具结果命中可疑模式 %s（%s）", flagged, name)
             await emitter.emit(
                 EventType.TOOL_RESULT,
                 {
@@ -230,6 +259,7 @@ def build_tool_node(
                     "truncated": result.truncated,
                     "duration_ms": result.duration_ms,
                     "preview": result.content[:400],
+                    "suspicious": flagged,
                 },
             )
             if recorded:
