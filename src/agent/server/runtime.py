@@ -71,6 +71,7 @@ class SessionRuntime:
             ctx=ctx,
             emitter=self.emitter,
             max_tool_rounds=settings.max_tool_rounds,
+            context_limit=settings.context_limit,
             checkpointer=checkpointer,
             db=db,
         )

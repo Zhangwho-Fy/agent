@@ -49,6 +49,7 @@ def build_graph(
     ctx: ToolContext,
     emitter: EventEmitter,
     max_tool_rounds: int = 12,
+    context_limit: int = 0,
     checkpointer: Any | None = None,
     db: Database | None = None,
 ) -> Any:
@@ -73,7 +74,11 @@ def build_graph(
     builder.add_node(
         "agent",
         build_model_node(
-            model, registry, system_prompt=_system_prompt, max_tool_rounds=max_tool_rounds
+            model,
+            registry,
+            system_prompt=_system_prompt,
+            max_tool_rounds=max_tool_rounds,
+            context_limit=context_limit,
         ),
     )
     builder.add_node("approve", build_approval_node(registry, policy))

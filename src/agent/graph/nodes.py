@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -23,6 +24,7 @@ from ..core.events import EventType
 from ..core.guard import scan_suspicious, strip_invisible, wrap_untrusted
 from ..core.prompt import STATIC_CORE
 from ..core.reliability import EventEmitter
+from ..core.status import StatusSnapshot, ToolStat
 from ..store import repo
 from ..store.db import Database
 from ..tools.base import ToolContext
@@ -63,6 +65,8 @@ def build_model_node(
     *,
     system_prompt: str | Callable[[AgentState], str] | None = None,
     max_tool_rounds: int = 12,
+    context_limit: int = 0,
+    clock: Callable[[], datetime] | None = None,
 ) -> Any:
     """模型节点：把工具清单绑给模型，收到回复就追加进状态。
 
@@ -82,6 +86,25 @@ def build_model_node(
             return STATIC_CORE  # 没给环境信息时退化成 L1；测试与嵌入式用法走这条
         return system_prompt(state) if callable(system_prompt) else system_prompt
 
+    def status_message(state: AgentState) -> SystemMessage:
+        """状态块：**只拼进这一次请求**，不写回 state（D19）。"""
+        snapshot = StatusSnapshot(
+            now=(clock or datetime.now)(),
+            rounds=int(state.get("rounds") or 0),
+            tool_rounds=int(state.get("tool_rounds") or 0),
+            max_tool_rounds=max_tool_rounds,
+            tool_stats={
+                name: ToolStat(
+                    calls=int(value.get("calls", 0)),
+                    failures=int(value.get("failures", 0)),
+                )
+                for name, value in (state.get("tool_stats") or {}).items()
+            },
+            context_tokens=int(state.get("context_tokens") or 0),
+            context_limit=context_limit,
+        )
+        return SystemMessage(content=snapshot.render_for_model())
+
     async def call_model(state: AgentState) -> dict[str, Any]:
         if (state.get("tool_rounds") or 0) >= max_tool_rounds:
             return {
@@ -95,14 +118,21 @@ def build_model_node(
                 ]
             }
 
-        messages = [SystemMessage(content=system_message_text(state)), *state["messages"]]
+        messages = [
+            SystemMessage(content=system_message_text(state)),
+            *state["messages"],
+            status_message(state),
+        ]
         response = _strip_reasoning(await bound_model.ainvoke(messages))
 
         usage = getattr(response, "usage_metadata", None) or {}
         previous = state.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens", 0)) or int(state.get("context_tokens") or 0)
         return {
             "messages": [response],
             "rounds": (state.get("rounds") or 0) + 1,
+            # 这一次调用实际塞进去的量，就是"上下文有多大"最直接的锚点
+            "context_tokens": input_tokens,
             "usage": {
                 "input_tokens": previous.get("input_tokens", 0) + int(usage.get("input_tokens", 0)),
                 "output_tokens": previous.get("output_tokens", 0)
@@ -182,6 +212,15 @@ def build_tool_node(
         approvals = state.get("approvals") or {}
         turn_id = state.get("turn_id") or None
         results: list[AnyMessage] = []
+        stats: dict[str, dict[str, int]] = {
+            name: dict(value) for name, value in (state.get("tool_stats") or {}).items()
+        }
+
+        def count(name: str, *, failed: bool) -> None:
+            """计数器由代码维护——状态块里的数字一个都不能让模型自己算（4.1）。"""
+            entry = stats.setdefault(name, {"calls": 0, "failures": 0})
+            entry["calls"] += 1
+            entry["failures"] += int(failed)
 
         for call in getattr(last, "tool_calls", None) or []:
             name = str(call.get("name", ""))
@@ -193,6 +232,7 @@ def build_tool_node(
 
             tool = registry.get(name)
             if tool is None:
+                count(name, failed=True)
                 content = f"未知工具：{name}"
                 results.append(ToolMessage(content=content, tool_call_id=call_id))
                 await emitter.emit(
@@ -217,6 +257,7 @@ def build_tool_node(
             # 拒绝与"未获批准"都走同一条路：不执行，把原因回填给模型
             refusal = _refusal_reason(decision, bool(approvals.get(call_id)))
             if refusal is not None:
+                count(name, failed=True)
                 results.append(ToolMessage(content=refusal, tool_call_id=call_id))
                 await emitter.emit(
                     EventType.TOOL_RESULT,
@@ -237,6 +278,7 @@ def build_tool_node(
                 continue
 
             result = await tool.run(args, ctx)
+            count(name, failed=not result.ok)
             if result.wrap == "none":
                 # 工具自己包好了容器（技能正文是**操作说明**，走 <skill> 块，见 3.5）。
                 # 不做可疑扫描：那是我们自己发布/用户确认过的说明文字，扫它只会制造噪音。
@@ -284,6 +326,7 @@ def build_tool_node(
         return {
             "messages": results,
             "tool_rounds": (state.get("tool_rounds") or 0) + 1,
+            "tool_stats": stats,
             "approvals": {},  # 本批用完了，清空，别影响下一批
         }
 
@@ -298,7 +341,13 @@ def _refusal_reason(decision: PolicyDecision, approved: bool) -> str | None:
     都是"这条路走不通，换个做法"）。
     """
     if decision.decision is Decision.DENY:
-        return f"未执行（拒绝）：{decision.reason}"
+        return (
+            f"未执行（拒绝）：{decision.reason}\n"
+            "别再重试同一个命令；换个做法，或者把这里被拦下来的情况告诉用户。"
+        )
     if decision.decision is Decision.APPROVAL and not approved:
-        return f"未执行（人工未批准）：{decision.reason}"
+        return (
+            f"未执行（人工未批准）：{decision.reason}\n"
+            "别原样重试；先说明你想做什么、为什么需要它，或者换一条不需要审批的路。"
+        )
     return None

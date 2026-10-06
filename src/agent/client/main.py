@@ -26,7 +26,7 @@ import sys
 import time
 import traceback
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -119,12 +119,31 @@ class ChatStatus:
     context_limit: int = 0
     phase: str = ""
     frame: int = 0
+    #: 本轮工具调用次数与上限，以及"同一个工具调了几次"的告警（第 4 节）。
+    #: 全部由事件本地计数——和给模型的状态块同源，但**渲染是两份**（4.6）。
+    tool_calls: int = 0
+    tool_limit: int = 0
+    repeat: str = ""
+    _tool_counts: dict[str, int] = field(default_factory=dict, repr=False)
 
     def track(self, usage: dict[str, Any]) -> None:
         self.last_input = int(usage.get("input_tokens", 0))
         self.last_output = int(usage.get("output_tokens", 0))
         self.total += self.last_input + self.last_output
         self.turns += 1
+
+    def begin_turn(self) -> None:
+        """新一轮开始：工具计数归零——它数的是"这一轮"，不是整个会话。"""
+        self.tool_calls = 0
+        self.repeat = ""
+        self._tool_counts = {}
+
+    def count_tool(self, name: str) -> None:
+        """记一次工具调用。调用次数 ≥2 时底栏亮出重复告警（人也要能看见）。"""
+        self.tool_calls += 1
+        self._tool_counts[name] = self._tool_counts.get(name, 0) + 1
+        worst = max(self._tool_counts.items(), key=lambda item: item[1])
+        self.repeat = f"{worst[0]}×{worst[1]}" if worst[1] >= 2 else ""
 
     def segments(self, *, aligned: bool = False) -> list[tuple[str, str]]:
         """状态栏的分段内容（样式类, 文本）。
@@ -166,14 +185,24 @@ class ChatStatus:
             percent = f"{ratio:>4.0%}" if aligned else f"{ratio:.0%}"
             used += f"/{self.context_limit}（{percent}）"
 
-        return [
+        tools = (
+            f"工具 {self.tool_calls:>2}/{self.tool_limit}"
+            if self.tool_limit
+            else f"工具 {self.tool_calls:>2}"
+        )
+
+        segments = [
             ("class:bar.model", f" {model}"),
             ("class:bar.dim", " │ 会话 "),
             ("class:bar.session", session),
             ("class:bar.dim", f" │ {self.workspace} │ "),
             (usage, used),
             ("class:bar.dim", f" │ {history} │ {total} │ {turns}"),
+            ("class:bar.dim", f" │ {tools}"),
         ]
+        if self.repeat:
+            segments.append(("class:bar.warn", f" │ ⚠ {self.repeat}"))
+        return segments
 
     def set_phase(self, phase: str) -> None:
         """进入某个执行阶段，底栏开始转圈。"""
@@ -452,6 +481,7 @@ TUI_STYLE = {
     "bar.usage.ok": "#9ece6a",  # 上下文占用：绿 → 黄 → 红
     "bar.usage.warn": "#e0af68",
     "bar.usage.hot": "#f7768e bold",
+    "bar.warn": "#e0af68 bold",  # 重复调用告警：人也要看得见
     "bar.busy": "#e0af68 bold",  # 执行中的阶段：黄
     "bar.idle": "#9ece6a",  # 空闲：绿点
     "bar.hint": "#bb9af7",  # 回滚提示：紫
@@ -1434,6 +1464,7 @@ async def _run_once(
         ctx=ctx,
         emitter=emitter,
         max_tool_rounds=settings.max_tool_rounds,
+        context_limit=settings.context_limit,
         checkpointer=open_checkpointer(settings.resolved_db_path),
         db=db,
     )
@@ -1857,6 +1888,7 @@ async def _chat(
             workspace=str(workspace) if workspace else "",
             session_id=session_id,
             context_limit=settings.context_limit,
+            tool_limit=settings.max_tool_rounds,
         )
         await _loop_tui(client, session_id, status, auto_approve)
         console.print("\n[dim]再见[/dim]")
@@ -1954,6 +1986,7 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                 if line.lower() in {"exit", "quit", ":q"}:
                     break
                 tui.echo_user(line)
+                status.begin_turn()
                 status.set_phase("思考中")
                 tui.refresh()
                 try:
@@ -1988,6 +2021,7 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                             continue
                         if kind == "tool.call":
                             status.set_phase(f"执行 {event.data.get('name')}")
+                            status.count_tool(str(event.data.get("name", "")))
                         elif kind == "tool.result":
                             status.set_phase("思考中")
                         elif kind == "reasoning.delta":

@@ -71,6 +71,17 @@ async def test_list_dir_marks_directories(tmp_path: Path) -> None:
     assert "README.md" in result.content
 
 
+async def test_list_dir_shows_mtime(tmp_path: Path) -> None:
+    """mtime 是"哪个文件最近改过"的答案——不用再给模型灌一遍系统时间（D23）。"""
+    import re
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+
+    result = await LIST_TOOL.run({"path": "."}, make_ctx(tmp_path))
+
+    assert re.search(r"\d{2}-\d{2} \d{2}:\d{2}", result.content)
+
+
 async def test_invalid_arguments_are_reported_not_raised(tmp_path: Path) -> None:
     result = await READ_TOOL.run({"path": "x.py", "start_line": 0}, make_ctx(tmp_path))
 

@@ -75,6 +75,7 @@ async def stream_turn(
         "messages": [HumanMessage(content=prompt)],
         "rounds": 0,
         "tool_rounds": 0,
+        "tool_stats": {},
         "turn_id": turn_id,
         "approvals": {},
     }

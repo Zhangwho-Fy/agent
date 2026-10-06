@@ -59,6 +59,31 @@ def test_chat_needs_a_real_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tui_problem() is None
 
 
+def test_tool_counter_and_repeat_warning_show_in_the_bar() -> None:
+    """人也要看得见"这一轮用了几个工具""是不是在同一个工具上打转"（4.6）。"""
+    status = ChatStatus(model="m", session_id="sess_1", tool_limit=12)
+    status.begin_turn()
+
+    status.count_tool("fs_read")
+    assert "工具  1/12" in _plain(status)
+    assert "⚠" not in _plain(status), "第一次调用只是正常往返，不该报警"
+
+    status.count_tool("fs_read")
+    assert "⚠ fs_read×2" in _plain(status)
+
+
+def test_begin_turn_resets_tool_counters() -> None:
+    status = ChatStatus(model="m", session_id="sess_1", tool_limit=12)
+    status.count_tool("fs_read")
+    status.count_tool("fs_read")
+
+    status.begin_turn()
+
+    text = _plain(status)
+    assert "工具  0/12" in text
+    assert "⚠" not in text
+
+
 def _bar(tui: ChatTUI) -> str:
     return "".join(text for _style, text in tui._status_fragments())
 

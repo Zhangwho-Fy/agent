@@ -130,6 +130,8 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
             policy=Policy(workspace),
             ctx=ToolContext(workspace=workspace),
             emitter=emitter,
+            max_tool_rounds=settings.max_tool_rounds,
+            context_limit=settings.context_limit,
             checkpointer=open_checkpointer(Path(tmp) / "ckpt.db"),
         )
 

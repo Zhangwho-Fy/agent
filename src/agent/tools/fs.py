@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from ..core.errors import PathEscapeError
@@ -27,9 +29,14 @@ async def read_file(args: ReadArgs, ctx: ToolContext) -> ToolResult:
         return ToolResult(ok=False, content=str(exc))
 
     if not target.exists():
-        return ToolResult(ok=False, content=f"文件不存在：{args.path}")
+        return ToolResult(
+            ok=False,
+            content=f"文件不存在：{args.path}。先 fs_list 它所在的目录，确认文件名和大小写",
+        )
     if target.is_dir():
-        return ToolResult(ok=False, content=f"{args.path} 是目录，请用 fs_list")
+        return ToolResult(
+            ok=False, content=f"{args.path} 是目录。列目录用 fs_list，读文件要指定具体文件"
+        )
 
     try:
         text = target.read_text(encoding="utf-8", errors="replace")
@@ -53,9 +60,11 @@ async def list_dir(args: ListArgs, ctx: ToolContext) -> ToolResult:
     except PathEscapeError as exc:
         return ToolResult(ok=False, content=str(exc))
     if not target.exists():
-        return ToolResult(ok=False, content=f"目录不存在：{args.path}")
+        return ToolResult(
+            ok=False, content=f"目录不存在：{args.path}。先 fs_list 它的上一级，看看实际结构"
+        )
     if not target.is_dir():
-        return ToolResult(ok=False, content=f"{args.path} 不是目录")
+        return ToolResult(ok=False, content=f"{args.path} 不是目录。读内容用 fs_read")
 
     entries = sorted(target.iterdir(), key=lambda entry: (not entry.is_dir(), entry.name))
     shown = entries[: args.max_entries]
@@ -65,10 +74,13 @@ async def list_dir(args: ListArgs, ctx: ToolContext) -> ToolResult:
             lines.append(f"{entry.name}/")
         else:
             try:
-                size = entry.stat().st_size
+                info = entry.stat()
+                # 带上 mtime：模型要判断"哪个是最近改的"时不用再问一遍时间（D23）
+                stamp = datetime.fromtimestamp(info.st_mtime).strftime("%m-%d %H:%M")
+                size = f"{info.st_size} B, {stamp}"
             except OSError:
-                size = -1
-            lines.append(f"{entry.name}  ({size} B)")
+                size = "?"
+            lines.append(f"{entry.name}  ({size})")
     if len(entries) > len(shown):
         lines.append(f"... 还有 {len(entries) - len(shown)} 项未列出")
 

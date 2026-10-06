@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,43 @@ async def test_skill_body_keeps_its_own_container(tmp_path: Path) -> None:
     content = update["messages"][0].content
     assert content.startswith('<skill name="debug" scope="builtin">')
     assert "<untrusted" not in content
+
+
+async def test_status_block_is_sent_but_never_stored(tmp_path: Path) -> None:
+    """D19：状态块只拼进这一次请求——不进 state、不进事件、不进 DB。"""
+    model = ScriptedModel([AIMessage(content="答案")])
+    node = build_model_node(
+        model,
+        default_registry(),
+        clock=lambda: datetime(2026, 10, 6, 16, 40),
+        max_tool_rounds=12,
+    )
+
+    update = await node({"messages": [HumanMessage(content="问")], "rounds": 2, "tool_rounds": 1})
+
+    sent = model.seen[0]
+    assert sent[-1].type == "system", "状态块挂在消息列表最后"
+    assert "<agent_state " in sent[-1].content
+    assert "<time>2026-10-06 16:40</time>" in sent[-1].content
+    assert "还能再做 11 次" in sent[-1].content
+    for message in update["messages"]:
+        assert "<agent_state" not in getattr(message, "content", "")
+
+
+async def test_tool_stats_are_counted_by_code(tmp_path: Path) -> None:
+    """状态块的数字全部由代码派生——模型不参与统计（4.1 的铁律）。"""
+    node = build_tool_node(
+        registry=default_registry(),
+        policy=Policy(tmp_path),
+        ctx=make_ctx(tmp_path),
+        emitter=make_emitter(),
+    )
+
+    ok = await node({"messages": [tool_call_reply()], "tool_rounds": 0})
+    assert ok["tool_stats"]["fs_list"] == {"calls": 1, "failures": 0}
+
+    missing = await node({"messages": [fs_read_reply("nope.py")], "tool_rounds": 0})
+    assert missing["tool_stats"]["fs_read"] == {"calls": 1, "failures": 1}
 
 
 def test_recursion_limit_leaves_room_for_every_round() -> None:
