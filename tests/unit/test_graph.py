@@ -10,13 +10,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from agent.core.bus import EventBus
 from agent.core.reliability import EventEmitter
 from agent.graph.bridge import recursion_limit_for, stream_turn
 from agent.graph.builder import build_graph
+from agent.graph.compress import build_compress_node
 from agent.graph.nodes import build_model_node, build_tool_node
+from agent.graph.state import AgentState
 from agent.tools.base import ToolContext
 from agent.tools.policy import Policy
 from agent.tools.registry import default_registry
@@ -262,6 +270,58 @@ async def test_tool_stats_are_counted_by_code(tmp_path: Path) -> None:
 
     missing = await node({"messages": [fs_read_reply("nope.py")], "tool_rounds": 0})
     assert missing["tool_stats"]["fs_read"] == {"calls": 1, "failures": 1}
+
+
+def _pairs_are_intact(messages: list[Any]) -> bool:
+    """每条工具结果都得有一个在它前面、id 对得上的工具调用。"""
+    seen: set[str] = set()
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            seen.add(str(call.get("id")))
+        if message.type == "tool":
+            if str(message.tool_call_id) not in seen:
+                return False
+    return True
+
+
+async def test_compress_node_rewrites_the_message_list_in_order() -> None:
+    """整表替换（RemoveAll + 原序追加）是压缩唯一安全的重写方式。
+
+    换成"删一条、补一条"的话，补的那条会被追加到列表末尾，配对就错位了。
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    messages: list[Any] = [HumanMessage(content="开始")]
+    for index in range(3):
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fs_read", "args": {}, "id": f"c{index}", "type": "tool_call"}
+                ],
+            )
+        )
+        messages.append(ToolMessage(content="长" * 500, tool_call_id=f"c{index}"))
+
+    builder = StateGraph(AgentState)
+    builder.add_node(
+        "compress",
+        build_compress_node(
+            emitter=make_emitter(),
+            model=ScriptedModel([AIMessage(content="## 任务\n（无）")]),
+            context_limit=1000,
+        ),
+    )
+    builder.add_edge(START, "compress")
+    builder.add_edge("compress", END)
+    graph = builder.compile()
+
+    result = await graph.ainvoke({"messages": messages, "context_tokens": 900, "turn_id": "turn_1"})
+    out = result["messages"]
+
+    assert _pairs_are_intact(out), "工具调用与结果必须仍然配对"
+    assert isinstance(out[0], SystemMessage) and "<memory" in out[0].content
+    assert [message.type for message in out][-1] == "tool", "尾部按原序保留"
 
 
 def test_recursion_limit_leaves_room_for_every_round() -> None:

@@ -26,6 +26,8 @@ class EventType(StrEnum):
     TOOL_RESULT = "tool.result"
     TURN_DONE = "turn.done"
     ERROR = "error"
+    #: 上下文被压缩过（指针化 / 摘要）。落库是必须的：崩溃恢复后重放要一致（D32）
+    CONTEXT_COMPRESSED = "context.compressed"
 
 
 class Event(BaseModel):

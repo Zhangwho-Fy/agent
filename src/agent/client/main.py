@@ -453,6 +453,13 @@ def format_event_plain(event: Any) -> str:
         return f"  ← {data.get('status')}\n"
     if kind == "approval.required":
         return f"需要确认：{data.get('name')}\n"
+    if kind == "context.compressed":
+        # 过程信息里给一行就够：指针化了几条、摘要了几条（细节在事件里）
+        return (
+            f"  ⇣ 压缩上下文 {data.get('ratio')}："
+            f"指针化 {len(data.get('pointerized') or [])} 条，"
+            f"摘要 {data.get('summarized', 0)} 条\n"
+        )
     if kind == "error":
         return f"错误：{data.get('message')}\n"
     return ""
@@ -464,7 +471,7 @@ def _event_line_kind(kind: str) -> str:
         return "error"
     if kind == "reasoning.delta":
         return "reason"
-    if kind in {"tool.call", "tool.result", "approval.required"}:
+    if kind in {"tool.call", "tool.result", "approval.required", "context.compressed"}:
         return "tool"
     return "assistant"
 
@@ -1419,6 +1426,7 @@ async def _run_once(
     # ---- 打开会话库，并做一次崩溃恢复 ----
     db = Database(settings.resolved_db_path)
     db.connect()
+    ctx.db = db  # recall（取回被压缩的工具原文）要用
     recovered = await repo.interrupt_running_turns(db)
     if recovered:
         console.print(f"[yellow]恢复：{recovered} 个没跑完的 turn 已标记为 interrupted[/yellow]")
@@ -1465,6 +1473,10 @@ async def _run_once(
         emitter=emitter,
         max_tool_rounds=settings.max_tool_rounds,
         context_limit=settings.context_limit,
+        compress_enabled=settings.compress_enabled,
+        compress_lossless_ratio=settings.compress_lossless_ratio,
+        compress_summary_ratio=settings.compress_summary_ratio,
+        compress_keep_recent=settings.compress_keep_recent_tool_results,
         checkpointer=open_checkpointer(settings.resolved_db_path),
         db=db,
     )

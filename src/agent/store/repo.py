@@ -343,6 +343,14 @@ async def list_tool_calls(db: Database, turn_id: str) -> list[sqlite3.Row]:
     )
 
 
+async def get_tool_call(db: Database, call_id: str) -> sqlite3.Row | None:
+    """按 call_id 取回一次工具调用的全量记录。
+
+    上下文压缩的`recall`走这条路：上下文里只留指针，原文一直在这里（D30）。
+    """
+    return await db.one("SELECT * FROM tool_calls WHERE id = ?", (call_id,))
+
+
 # ---------------------------------------------------------------- idempotency
 
 

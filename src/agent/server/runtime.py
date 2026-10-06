@@ -54,6 +54,7 @@ class SessionRuntime:
             workspace=Path(workspace).expanduser().resolve(),
             timeout_s=settings.tool_timeout_s,
             output_limit_bytes=settings.output_limit_bytes,
+            db=db,
         )
         policy = Policy(ctx.workspace)
         registry = default_registry()
@@ -72,6 +73,10 @@ class SessionRuntime:
             emitter=self.emitter,
             max_tool_rounds=settings.max_tool_rounds,
             context_limit=settings.context_limit,
+            compress_enabled=settings.compress_enabled,
+            compress_lossless_ratio=settings.compress_lossless_ratio,
+            compress_summary_ratio=settings.compress_summary_ratio,
+            compress_keep_recent=settings.compress_keep_recent_tool_results,
             checkpointer=checkpointer,
             db=db,
         )

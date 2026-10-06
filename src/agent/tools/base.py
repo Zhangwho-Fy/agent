@@ -25,6 +25,8 @@ class ToolContext(BaseModel):
     workspace: Path
     timeout_s: float = 60.0
     output_limit_bytes: int = 8192
+    #: 会话库。只有 `recall`（取回被压缩的工具原文）用得上，可以不传
+    db: Any = None
 
 
 class ToolResult(BaseModel):

@@ -53,6 +53,20 @@ class Settings(BaseSettings):
         description="模型上下文窗口（token），只用于交互式状态栏显示占用比例",
     )
 
+    # ---- 上下文压缩（docs/context-engineering.md 第 5 节）----
+    compress_enabled: bool = Field(
+        default=True, description="打开上下文压缩；评测与回放建议关掉，保证确定性"
+    )
+    compress_lossless_ratio: float = Field(
+        default=0.6, gt=0, le=1, description="占用率超过它做指针化（零 LLM 调用）"
+    )
+    compress_summary_ratio: float = Field(
+        default=0.8, gt=0, le=1, description="占用率超过它才动摘要（要一次 LLM 调用）"
+    )
+    compress_keep_recent_tool_results: int = Field(
+        default=4, ge=0, description="指针化时保留最近几条工具结果的原文"
+    )
+
     # ---- 服务 ----
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)

@@ -132,6 +132,8 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
             emitter=emitter,
             max_tool_rounds=settings.max_tool_rounds,
             context_limit=settings.context_limit,
+            # 评测要确定性：压缩会改写消息序列，把录放夹具打乱（D32）
+            compress_enabled=False,
             checkpointer=open_checkpointer(Path(tmp) / "ckpt.db"),
         )
 

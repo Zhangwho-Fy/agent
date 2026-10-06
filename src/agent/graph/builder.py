@@ -2,8 +2,8 @@
 
 形状：
 
-    START → agent ──(有工具调用)──→ approve ──→ tools ──→ agent
-              └────(没有工具调用)────────────→ END
+    START → compress → agent ──(有工具调用)──→ approve ──→ tools ──→ agent
+                          └────(没有工具调用)────────────→ END
 
 条件边 `_route` 就是"循环要不要继续"的判据，等价于手写版里的
 `if not tool_calls: return`。
@@ -26,6 +26,7 @@ from ..store.db import Database
 from ..tools.base import ToolContext
 from ..tools.policy import Policy
 from ..tools.registry import ToolRegistry
+from .compress import build_compress_node
 from .nodes import build_approval_node, build_model_node, build_tool_node
 from .state import AgentState
 
@@ -50,6 +51,10 @@ def build_graph(
     emitter: EventEmitter,
     max_tool_rounds: int = 12,
     context_limit: int = 0,
+    compress_enabled: bool = True,
+    compress_lossless_ratio: float = 0.6,
+    compress_summary_ratio: float = 0.8,
+    compress_keep_recent: int = 4,
     checkpointer: Any | None = None,
     db: Database | None = None,
 ) -> Any:
@@ -59,6 +64,18 @@ def build_graph(
     所以要用审批流就必须接上它。`db` 用来记工具调用审计，可以不传。
     """
     builder = StateGraph(AgentState)
+    builder.add_node(
+        "compress",
+        build_compress_node(
+            emitter=emitter,
+            model=model,
+            context_limit=context_limit,
+            lossless_ratio=compress_lossless_ratio,
+            summary_ratio=compress_summary_ratio,
+            keep_recent_tool_results=compress_keep_recent,
+            enabled=compress_enabled,
+        ),
+    )
 
     def _system_prompt(state: AgentState) -> str:
         """每次模型调用现拼（L1 + L2）。
@@ -86,7 +103,8 @@ def build_graph(
         "tools",
         build_tool_node(registry=registry, policy=policy, ctx=ctx, emitter=emitter, db=db),
     )
-    builder.add_edge(START, "agent")
+    builder.add_edge(START, "compress")
+    builder.add_edge("compress", "agent")
     builder.add_conditional_edges("agent", _route, {"tools": "approve", "end": END})
     builder.add_edge("approve", "tools")
     builder.add_edge("tools", "agent")

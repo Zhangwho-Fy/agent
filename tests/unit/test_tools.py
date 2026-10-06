@@ -95,6 +95,7 @@ def test_default_registry_exposes_the_expected_tools() -> None:
     assert registry.names == [
         "fs_list",
         "fs_read",
+        "recall",
         "shell_exec",
         "skill_create",
         "skill_load",
