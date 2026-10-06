@@ -13,6 +13,7 @@ from .embeddings import Embedder, HashingEmbedder, build_embedder
 from .index import RetrievalIndex
 from .metrics import EvalCase, EvalReport, evaluate
 from .search import SearchHit, hybrid_search
+from .service import SearchService, clear_search_services, get_search_service, index_path_for
 
 __all__ = [
     "Chunk",
@@ -22,9 +23,13 @@ __all__ = [
     "HashingEmbedder",
     "RetrievalIndex",
     "SearchHit",
+    "SearchService",
     "build_embedder",
     "chunk_file",
+    "clear_search_services",
     "evaluate",
+    "get_search_service",
     "hybrid_search",
+    "index_path_for",
     "iter_source_files",
 ]

@@ -44,11 +44,15 @@ class Database:
 
     # ---- 生命周期 ----
 
-    def connect(self) -> None:
+    def connect(self, *, apply_schema: bool = True) -> None:
         """打开连接、建目录、执行建表语句。
 
         幂等：`schema.sql` 全是 `IF NOT EXISTS`，重复调用没有副作用。
         写成同步方法是因为它只在启动时跑一次，而且失败要立刻暴露。
+
+        `apply_schema=False` 给**旁路库**用（记忆库、检索索引库）：它们各有自己的建表
+        语句，不该被塞进会话库的六张表——那样删会话时 `_SESSION_TABLES` 会多删一堆
+        与它无关的表。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
@@ -60,7 +64,8 @@ class Database:
         conn.execute("PRAGMA synchronous=NORMAL")
         # 外键默认是关的，必须显式打开，否则 REFERENCES 只是注释
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        if apply_schema:
+            conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.commit()
         self._conn = conn
 

@@ -122,6 +122,10 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
     emitter.on_event = events.append
 
     with tempfile.TemporaryDirectory() as tmp:
+        # 评测必须与开发机隔离：记忆库和索引都放临时目录。否则同一个用例在
+        # "有记忆的机器"和 CI 上跑出两种结果，而且会把开发机的真实记忆喂给模型。
+        settings.memory_db_path = Path(tmp) / "memory.db"
+        settings.index_dir = Path(tmp) / "index"
         wiring = build_session_graph(
             settings,
             workspace=workspace,

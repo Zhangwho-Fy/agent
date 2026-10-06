@@ -8,7 +8,10 @@ from typing import Any
 from ..core.tool_spec import ToolSpec
 from .base import Tool
 from .fs import LIST_TOOL, READ_TOOL
+from .memory import SEARCH_TOOL as MEMORY_SEARCH_TOOL
+from .memory import WRITE_TOOL as MEMORY_WRITE_TOOL
 from .recall import RECALL_TOOL
+from .search_code import SEARCH_CODE_TOOL
 from .shell import EXEC_TOOL
 from .skill import SKILL_CREATE_TOOL, SKILL_LOAD_TOOL
 
@@ -36,11 +39,23 @@ class ToolRegistry:
 
 
 def default_registry() -> ToolRegistry:
-    """默认工具集：文件、命令、技能。
+    """默认工具集：文件、命令、技能、检索、记忆。
 
-    检索类工具还没接（`search_code` 是 AGENTS.md 7.4 记的那笔小账）——
-    在它落地之前，读代码靠 `fs_list` + `fs_read`。
+    `search_code` / `memory_search` / `memory_write` 都**常驻注册表**：它们的运行时
+    依赖（索引、记忆库）由装配层通过 `ToolContext` 注入，没接的时候工具返回一句人话，
+    和 `recall` 在没接会话库时的做法一样。这样"工具清单"不随运行方式变化，
+    L2 里的工具列表与提示缓存前缀也就稳定。
     """
     return ToolRegistry(
-        [READ_TOOL, LIST_TOOL, EXEC_TOOL, RECALL_TOOL, SKILL_LOAD_TOOL, SKILL_CREATE_TOOL]
+        [
+            READ_TOOL,
+            LIST_TOOL,
+            EXEC_TOOL,
+            RECALL_TOOL,
+            SKILL_LOAD_TOOL,
+            SKILL_CREATE_TOOL,
+            SEARCH_CODE_TOOL,
+            MEMORY_SEARCH_TOOL,
+            MEMORY_WRITE_TOOL,
+        ]
     )

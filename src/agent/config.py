@@ -72,6 +72,22 @@ class Settings(BaseSettings):
         default=4, ge=0, description="指针化时保留最近几条工具结果的原文"
     )
 
+    # ---- 检索与用户记忆（docs/design.md 第 8 / 9 节）----
+    embed_backend: Literal["offline", "fastembed"] = Field(
+        default="offline",
+        description="嵌入后端。offline 是确定性兜底（不联网），fastembed 要装依赖并下权重",
+    )
+    embed_model: str = Field(default="", description="fastembed 的模型名，留空用默认")
+    memory_db_path: Path | None = Field(
+        default=None, description="长期记忆库路径；留空取会话库旁边的 memory.db（D37）"
+    )
+    index_dir: Path | None = Field(
+        default=None, description="检索索引目录，按工作区分文件；留空取会话库旁边的 index/"
+    )
+    memory_digest_limit: int = Field(
+        default=5, ge=0, le=20, description="每轮摘要最多注入几条记忆（D44 / 8.5）"
+    )
+
     # ---- 服务 ----
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
@@ -95,6 +111,18 @@ class Settings(BaseSettings):
     @property
     def resolved_db_path(self) -> Path:
         return self.db_path.expanduser()
+
+    @property
+    def resolved_memory_db_path(self) -> Path:
+        if self.memory_db_path is not None:
+            return self.memory_db_path.expanduser()
+        return self.resolved_db_path.parent / "memory.db"
+
+    @property
+    def resolved_index_dir(self) -> Path:
+        if self.index_dir is not None:
+            return self.index_dir.expanduser()
+        return self.resolved_db_path.parent / "index"
 
     def describe(self) -> dict[str, str]:
         """给人看的配置摘要：敏感字段只报告"有没有设置"，不报告内容。"""

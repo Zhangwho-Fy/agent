@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
@@ -65,6 +65,7 @@ def build_model_node(
     registry: ToolRegistry,
     *,
     system_prompt: str | Callable[[AgentState], str] | None = None,
+    memory_digest: Callable[[AgentState], Awaitable[str]] | None = None,
     max_tool_rounds: int = 12,
     context_limit: int = 0,
     clock: Callable[[], datetime] | None = None,
@@ -74,6 +75,10 @@ def build_model_node(
     `system_prompt` 允许传一个**接收 state 的可调用对象**，不是洁癖：技能目录按轮冻结
     （D11），每次模型调用都要拿到当期的那一份，而"当期"只能从 state 里的 `turn_id` 看出来。
     传字符串则固定不变。
+
+    `memory_digest` 是每轮现拼的记忆摘要（8.5 / D44）：**与状态块同一套机制**，拼进
+    这一次请求的尾部，不进 state、不进事件、不进 DB。写进历史会留下过期副本，
+    被后面几轮当成同样可信的事实。
 
     **循环上限在这里兜底**：工具往返次数用尽后不再调用模型，直接给一条收尾消息——
     它没有 `tool_calls`，条件边 `_route` 看到就会走到 END，循环停住。
@@ -119,11 +124,13 @@ def build_model_node(
                 ]
             }
 
-        messages = [
-            SystemMessage(content=system_message_text(state)),
-            *state["messages"],
-            status_message(state),
-        ]
+        tail: list[AnyMessage] = []
+        if memory_digest is not None:
+            block = await memory_digest(state)
+            if block:
+                tail.append(SystemMessage(content=block))
+        tail.append(status_message(state))
+        messages = [SystemMessage(content=system_message_text(state)), *state["messages"], *tail]
         response = _strip_reasoning(await bound_model.ainvoke(messages))
 
         usage = getattr(response, "usage_metadata", None) or {}
@@ -286,11 +293,16 @@ def build_tool_node(
                     )
                 continue
 
-            result = await tool.run(args, ctx)
+            # 把本轮 turn_id 带进 ctx：记忆写入要记出处（8.4）。ctx 是会话级、
+            # turn_id 是轮级，所以只在这一刻合成一个副本，不改共享对象。
+            call_ctx = ctx.model_copy(update={"turn_id": turn_id}) if turn_id else ctx
+            result = await tool.run(args, call_ctx)
             count(name, failed=not result.ok)
             if result.wrap == "none":
-                # 工具自己包好了容器（技能正文是**操作说明**，走 <skill> 块，见 3.5）。
-                # 不做可疑扫描：那是我们自己发布/用户确认过的说明文字，扫它只会制造噪音。
+                # 工具自己包好了容器：技能正文是**操作说明**（<skill>，见 7.2），
+                # 记忆是按来源分层的 <memory_context>（D40，<untrusted> 由渲染器就该包的
+                # 那些条目自己包好）。这条分支不再套一层，否则会把 user_stated 的偏好
+                # 一起降级成"数据"，模型就不敢按它办事了。
                 content = strip_invisible(result.content)
                 flagged: list[str] = []
             else:

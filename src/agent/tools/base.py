@@ -28,6 +28,18 @@ class ToolContext(BaseModel):
     #: 按 call_id 取回工具调用记录的回调（只有 `recall` 用得上，可以不传）。
     #: 由装配层注入 store 的函数——**工具不认识数据库**，它们只知道"有个取回原文的入口"。
     fetch_tool_call: Callable[[str], Awaitable[Any]] | None = None
+    #: 代码检索回调（只有 `search_code` 用得上）。签名：
+    #: `(query, limit, path_prefix) -> list[SearchHit]`。同样由装配层注入，
+    #: 工具不认识索引、更不认识 sqlite（见 9.3）。
+    fetch_search: Callable[..., Awaitable[Any]] | None = None
+    #: 长期记忆库（只有 memory_write / memory_search 用得上）。鸭子类型：
+    #: 工具只调 `write()` / `search()`，不 import `agent.memory`（见 8.7）。
+    memory: Any | None = None
+    #: 本会话工作区对应的记忆 scope（`workspace:<realpath>`）
+    memory_scope: str = ""
+    #: 会话与轮次，写入记忆时当出处（8.4 的"有明确来源"）
+    session_id: str = ""
+    turn_id: str = ""
 
 
 class ToolResult(BaseModel):

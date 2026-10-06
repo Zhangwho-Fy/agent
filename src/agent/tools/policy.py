@@ -130,6 +130,11 @@ class Policy:
         if tool.name == "shell_exec":
             return self._classify_command(str(args.get("command", "")))
 
+        # 唯一的 WRITE 例外（D42）：记忆写入可撤销（archive）、没有工作区外副作用，
+        # 每次记一条偏好都弹审批会把功能废掉。硬删除不走这个工具，仍要审批。
+        if tool.name == "memory_write":
+            return PolicyDecision(decision=Decision.AUTO, reason="记忆写入可撤销，免审批（D42）")
+
         if tool.tier is Tier.WRITE:
             return PolicyDecision(decision=Decision.APPROVAL, reason=f"{tool.name} 会修改工作区")
 
