@@ -9,6 +9,7 @@ from ..core.tool_spec import ToolSpec
 from .base import Tool
 from .fs import LIST_TOOL, READ_TOOL
 from .shell import EXEC_TOOL
+from .skill import SKILL_CREATE_TOOL, SKILL_LOAD_TOOL
 
 
 class ToolRegistry:
@@ -34,5 +35,9 @@ class ToolRegistry:
 
 
 def default_registry() -> ToolRegistry:
-    """阶段 1 的三个工具。搜索类工具在阶段 5 接入。"""
-    return ToolRegistry([READ_TOOL, LIST_TOOL, EXEC_TOOL])
+    """默认工具集：文件、命令、技能。
+
+    检索类工具还没接（`search_code` 是 AGENTS.md 7.4 记的那笔小账）——
+    在它落地之前，读代码靠 `fs_list` + `fs_read`。
+    """
+    return ToolRegistry([READ_TOOL, LIST_TOOL, EXEC_TOOL, SKILL_LOAD_TOOL, SKILL_CREATE_TOOL])

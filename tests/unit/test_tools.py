@@ -78,10 +78,16 @@ async def test_invalid_arguments_are_reported_not_raised(tmp_path: Path) -> None
     assert "参数不合法" in result.content
 
 
-def test_default_registry_exposes_three_tools() -> None:
+def test_default_registry_exposes_the_expected_tools() -> None:
     registry = default_registry()
 
-    assert registry.names == ["fs_list", "fs_read", "shell_exec"]
+    assert registry.names == [
+        "fs_list",
+        "fs_read",
+        "shell_exec",
+        "skill_create",
+        "skill_load",
+    ]
     specs = {spec.name: spec for spec in registry.specs()}
     assert specs["fs_read"].parameters["properties"]["path"]["type"] == "string"
     assert specs["shell_exec"].to_openai()["type"] == "function"

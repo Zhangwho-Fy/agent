@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ..core.prompt import render_system_prompt
 from ..core.reliability import EventEmitter
+from ..skills.loader import catalog_text
 from ..store.db import Database
 from ..tools.base import ToolContext
 from ..tools.policy import Policy
@@ -58,9 +59,16 @@ def build_graph(
     """
     builder = StateGraph(AgentState)
 
-    def _system_prompt() -> str:
-        """每次模型调用现拼（L1 + L2）。传函数而不是字符串：技能目录会随会话变化（D11）。"""
-        return render_system_prompt(workspace=ctx.workspace, tool_names=registry.names)
+    def _system_prompt(state: AgentState) -> str:
+        """每次模型调用现拼（L1 + L2）。
+
+        传函数而不是字符串：技能目录按轮冻结（D11），"当期"只能从 state 的 `turn_id` 看出来。
+        """
+        return render_system_prompt(
+            workspace=ctx.workspace,
+            tool_names=registry.names,
+            skills_catalog=catalog_text(ctx.workspace, str(state.get("turn_id") or "")),
+        )
 
     builder.add_node(
         "agent",

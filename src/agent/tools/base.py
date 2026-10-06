@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -35,6 +35,11 @@ class ToolResult(BaseModel):
     truncated: bool = False
     exit_code: int | None = None
     duration_ms: int = 0
+    #: 进上下文时的包装方式（见 core/guard.py）：
+    #: - `untrusted`：外部内容，包 `<untrusted source=…>`（默认）
+    #: - `none`：工具自己已经包好了。技能正文走这条——它是**操作说明**，
+    #:   不是"仅供参考的资料"，所以用 `<skill>` 块（D12）
+    wrap: Literal["untrusted", "none"] = "untrusted"
 
 
 def resolve_within(workspace: Path, raw: str) -> Path:

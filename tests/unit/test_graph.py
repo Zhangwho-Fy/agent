@@ -173,13 +173,57 @@ async def test_system_prompt_is_rebuilt_between_calls() -> None:
     """传函数而不是字符串：技能目录在轮边界刷新后（D11），下一次调用要拿到新的一份。"""
     current = {"text": "第一版"}
     model = ScriptedModel([AIMessage(content="答案")])
-    node = build_model_node(model, default_registry(), system_prompt=lambda: current["text"])
+    node = build_model_node(model, default_registry(), system_prompt=lambda state: current["text"])
 
     await node({"messages": [HumanMessage(content="一")]})
     current["text"] = "第二版"
     await node({"messages": [HumanMessage(content="二")]})
 
     assert [messages[0].content for messages in model.seen] == ["第一版", "第二版"]
+
+
+async def test_graph_injects_the_skill_catalog(tmp_path: Path) -> None:
+    """L2 要真的拼进系统提示：环境块 + 技能目录（第 3 节）。"""
+    model = ScriptedModel([AIMessage(content="答案")])
+    emitter = make_emitter()
+    graph = build_graph(
+        model=model,
+        registry=default_registry(),
+        policy=Policy(tmp_path),
+        ctx=make_ctx(tmp_path),
+        emitter=emitter,
+    )
+
+    await stream_turn(
+        graph=graph,
+        prompt="问一句",
+        emitter=emitter,
+        session_id="sess_test",
+        turn_id="turn_1",
+    )
+
+    system = model.seen[0][0]
+    assert system.type == "system"
+    assert "<environment>" in system.content
+    assert "<skills" in system.content
+    assert 'name="debug"' in system.content
+
+
+async def test_skill_body_keeps_its_own_container(tmp_path: Path) -> None:
+    """技能正文走 `<skill>` 而不是 `<untrusted>`：它是操作说明（3.5）。"""
+    node = build_tool_node(
+        registry=default_registry(),
+        policy=Policy(tmp_path),
+        ctx=make_ctx(tmp_path),
+        emitter=make_emitter(),
+    )
+    call = {"name": "skill_load", "args": {"name": "debug"}, "id": "call_1", "type": "tool_call"}
+
+    update = await node({"messages": [AIMessage(content="", tool_calls=[call])], "tool_rounds": 0})
+
+    content = update["messages"][0].content
+    assert content.startswith('<skill name="debug" scope="builtin">')
+    assert "<untrusted" not in content
 
 
 def test_recursion_limit_leaves_room_for_every_round() -> None:
