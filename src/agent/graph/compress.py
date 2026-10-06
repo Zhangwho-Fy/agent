@@ -20,10 +20,10 @@ from langchain_core.messages import RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from ..core.compress import (
-    memory_message,
     plan,
     pointerize,
     split_for_summary,
+    summary_message,
     summary_request,
 )
 from ..core.events import EventType
@@ -76,7 +76,7 @@ def build_compress_node(
                     response = await model.ainvoke(summary_request(prefix))
                     text = response.content if isinstance(response.content, str) else ""
                     if text.strip():
-                        remaining = [memory_message(text), *keep]
+                        remaining = [summary_message(text), *keep]
                         summarized = len(prefix)
                         failures = 0
                     else:

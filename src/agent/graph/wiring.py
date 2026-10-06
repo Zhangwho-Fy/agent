@@ -131,7 +131,7 @@ def build_session_graph(
             # 不能让整个会话跟着失败。真正的异常留给日志，模型看不到。
             logger.warning("记忆摘要失败，这一轮跳过", exc_info=True)
             return ""
-        return render_memories(cards)
+        return render_memories(cards, max_chars=settings.memory_digest_max_chars)
 
     registry = default_registry()
     policy = Policy(ctx.workspace)

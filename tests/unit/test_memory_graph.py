@@ -23,6 +23,8 @@ from agent.graph.wiring import build_session_graph, get_memory_store, reset_runt
 from agent.memory import GLOBAL_SCOPE, MemoryKind, MemoryStore
 from agent.memory.render import render_memories
 from agent.retrieval.embeddings import HashingEmbedder
+from agent.store import repo
+from agent.store.db import Database
 from agent.tools.registry import default_registry
 
 
@@ -74,6 +76,12 @@ def _reset_caches() -> Iterator[None]:
 
 async def test_memory_write_runs_through_the_graph_without_approval(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
+    session_db = Database(tmp_path / "agent.db")
+    session_db.connect()
+    await repo.create_session(
+        session_db, session_id="sess_mem", profile="code", workspace=str(tmp_path)
+    )
+    await repo.start_turn(session_db, turn_id="turn_mem", session_id="sess_mem")
     model = ScriptedModel(
         [
             tool_call(
@@ -84,26 +92,35 @@ async def test_memory_write_runs_through_the_graph_without_approval(tmp_path: Pa
         ]
     )
     emitter = EventEmitter("sess_mem", EventBus())
-    wiring = build_session_graph(settings, workspace=tmp_path, model=model, emitter=emitter)
+    wiring = build_session_graph(
+        settings, workspace=tmp_path, model=model, emitter=emitter, db=session_db
+    )
     asked: list[Any] = []
 
     async def approver(requests: list[dict[str, Any]]) -> dict[str, bool]:
         asked.append(requests)
         return {request["call_id"]: False for request in requests}
 
-    result = await stream_turn(
-        graph=wiring.graph,
-        prompt="记住：以后都用中文回答",
-        emitter=emitter,
-        session_id="sess_mem",
-        turn_id="turn_mem",
-        recursion_limit=recursion_limit_for(settings.max_tool_rounds),
-        approver=approver,
-        approval_timeout_s=1,
-    )
+    try:
+        result = await stream_turn(
+            graph=wiring.graph,
+            prompt="记住：以后都用中文回答",
+            emitter=emitter,
+            session_id="sess_mem",
+            turn_id="turn_mem",
+            recursion_limit=recursion_limit_for(settings.max_tool_rounds),
+            approver=approver,
+            approval_timeout_s=1,
+        )
+        # 审计免费复用现有流水线（D47）：记忆写入也躺在 tool_calls 表里
+        calls = await repo.list_tool_calls(session_db, "turn_mem")
+    finally:
+        await session_db.close()
 
     assert result.status == "done", result.text
     assert asked == [], "D42：记忆写入免审批，approver 不该被叫到"
+    assert [str(call["name"]) for call in calls] == ["memory_write"]
+    assert calls[0]["decision"] == "auto"
     cards = await get_memory_store(settings).list_cards(scopes=[GLOBAL_SCOPE])
     assert [card.content for card in cards] == ["用户偏好中文回答"]
 

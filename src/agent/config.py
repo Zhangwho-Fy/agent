@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     memory_digest_limit: int = Field(
         default=5, ge=0, le=20, description="每轮摘要最多注入几条记忆（D44 / 8.5）"
     )
+    memory_digest_max_chars: int = Field(
+        default=600,
+        ge=0,
+        le=4000,
+        description="每轮记忆摘要的字符预算；0 表示不限（8.5 的硬预算）",
+    )
 
     # ---- 服务 ----
     host: str = "127.0.0.1"

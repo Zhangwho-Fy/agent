@@ -338,7 +338,7 @@ async def test_compress_node_rewrites_the_message_list_in_order() -> None:
     out = result["messages"]
 
     assert _pairs_are_intact(out), "工具调用与结果必须仍然配对"
-    assert isinstance(out[0], SystemMessage) and "<memory" in out[0].content
+    assert isinstance(out[0], SystemMessage) and "<session_summary" in out[0].content
     assert [message.type for message in out][-1] == "tool", "尾部按原序保留"
 
 

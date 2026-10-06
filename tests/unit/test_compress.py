@@ -16,10 +16,10 @@ from agent.core.bus import EventBus
 from agent.core.compress import (
     MIN_COMPRESS_CHARS,
     POINTER_HEAD_CHARS,
-    memory_message,
     plan,
     pointerize,
     split_for_summary,
+    summary_message,
     summary_request,
 )
 from agent.core.reliability import EventEmitter
@@ -133,9 +133,11 @@ def test_summary_request_states_the_protected_facts() -> None:
     assert "第0份输出" in human.content
 
 
-def test_memory_message_is_wrapped() -> None:
-    text = memory_message("## 任务\n修 bug").content
-    assert text.startswith("<memory ") and text.rstrip().endswith("</memory>")
+def test_summary_message_is_wrapped_in_a_session_summary_tag() -> None:
+    """D36：压缩产物的标签是 `<session_summary>`，不是 `<memory>`。"""
+    text = summary_message("## 任务\n修 bug").content
+    assert text.startswith("<session_summary ")
+    assert text.rstrip().endswith("</session_summary>")
 
 
 class FakeModel:
@@ -197,7 +199,7 @@ async def test_node_summarizes_at_the_high_threshold() -> None:
 
     assert model.calls == 1
     first = update["messages"][1]
-    assert isinstance(first, SystemMessage) and "<memory" in first.content
+    assert isinstance(first, SystemMessage) and "<session_summary" in first.content
     assert "a.py" in first.content
     assert events[0].data["summarized"] > 0
 
@@ -247,7 +249,7 @@ async def test_compression_survives_a_checkpointer(tmp_path: Path) -> None:
     stored = state.values["messages"]
 
     assert len(stored) < len(messages), "前段被换成了一条摘要"
-    assert isinstance(stored[0], SystemMessage) and "<memory" in stored[0].content
+    assert isinstance(stored[0], SystemMessage) and "<session_summary" in stored[0].content
     assert any(
         isinstance(message, ToolMessage) and message.content.startswith("<compressed ")
         for message in stored

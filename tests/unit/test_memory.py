@@ -23,6 +23,8 @@ from agent.memory import (
 from agent.memory.render import render_memories
 from agent.memory.store import MemoryRejected
 from agent.retrieval.embeddings import HashingEmbedder
+from agent.store import repo
+from agent.store.db import Database
 from agent.tools.base import ToolContext
 from agent.tools.memory import SEARCH_TOOL, WRITE_TOOL
 from agent.tools.policy import Decision, Policy
@@ -220,3 +222,61 @@ def test_render_keeps_user_stated_trusted_and_escapes_the_rest() -> None:
 
 def test_empty_render_is_empty() -> None:
     assert render_memories([]) == ""
+
+
+def test_render_budget_drops_cards_that_do_not_fit() -> None:
+    """8.5 的硬预算：摘要块在请求尾部，每次都付全价，宁可不给也不能超。"""
+    cards = [
+        MemoryCard(
+            id=f"mem_{index}",
+            scope=GLOBAL_SCOPE,
+            kind=MemoryKind.FACT,
+            content=f"第{index}条事实" + "x" * 80,
+        )
+        for index in range(5)
+    ]
+
+    text = render_memories(cards, max_chars=400)
+
+    assert text
+    assert len(text) <= 400
+    assert text.count("<memory ") < len(cards), "放不下的卡片整条丢掉"
+
+
+def test_render_budget_returns_nothing_when_one_card_already_blows_it() -> None:
+    card = MemoryCard(id="mem_a", scope=GLOBAL_SCOPE, kind=MemoryKind.FACT, content="x" * 500)
+
+    assert render_memories([card], max_chars=100) == ""
+
+
+async def test_deleting_a_session_does_not_delete_its_memories(tmp_path: Path) -> None:
+    """D37 的核心理由：记忆的寿命和会话不一致。
+
+    会话库开着外键、删表有严格顺序；记忆要是挂在 `sessions(id)` 上，
+    删会话要么把它一起删了、要么直接撞约束——所以它是独立库 + 软引用。
+    """
+    session_db = Database(tmp_path / "agent.db")
+    session_db.connect()
+    store = MemoryStore(tmp_path / "memory.db", embedder=HashingEmbedder())
+    try:
+        await repo.create_session(
+            session_db, session_id="sess_x", profile="code", workspace=str(tmp_path)
+        )
+        card = await store.write(
+            scope=scope_for(tmp_path),
+            kind=MemoryKind.DECISION,
+            content="这个项目不引入 MCP",
+            key="decision.mcp",
+            source_session="sess_x",
+        )
+
+        await repo.delete_session(session_db, "sess_x")
+
+        assert await repo.get_session(session_db, "sess_x") is None
+        survivor = await store.get(card.id)
+        assert survivor is not None, "删会话不能连带删掉它贡献的长期记忆"
+        assert survivor.content == "这个项目不引入 MCP"
+        assert survivor.source_session == "sess_x", "软引用保留，回原始证据时还找得到出处"
+    finally:
+        await store.close()
+        await session_db.close()

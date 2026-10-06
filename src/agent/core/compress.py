@@ -166,11 +166,17 @@ def summary_request(prefix: Sequence[AnyMessage]) -> list[AnyMessage]:
     return [SystemMessage(content=SUMMARY_PROMPT), HumanMessage(content=body)]
 
 
-def memory_message(summary: str) -> SystemMessage:
-    """摘要产物的容器。用 system 角色：它是系统给的事实底稿，不是用户说的话。"""
+def summary_message(summary: str) -> SystemMessage:
+    """摘要产物的容器。用 system 角色：它是系统给的事实底稿，不是用户说的话。
+
+    标签是 `<session_summary>`：它压的是**会话内**的历史，不是第 8 节那套跨会话的
+    长期记忆（`<memory>` / `<memory_context>` 留给那边，见 D36）。两者混用一个名字，
+    模型会把"某些工具输出已压缩"误读成"这是长期记忆"。
+    """
     return SystemMessage(
         content=(
-            '<memory note="更早的对话已压缩成这些事实；需要原文时用 recall(call_id=…)">\n'
-            f"{summary.strip()}\n</memory>"
+            '<session_summary note="更早的对话已压缩成这些事实；'
+            '需要原文时用 recall(call_id=…)">\n'
+            f"{summary.strip()}\n</session_summary>"
         )
     )
