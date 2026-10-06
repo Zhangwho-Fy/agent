@@ -42,6 +42,11 @@ async def _route(state: AgentState) -> str:
     return "tools" if getattr(last, "tool_calls", None) else "end"
 
 
+async def _route_after_tools(state: AgentState) -> str:
+    """工具跑完：除非这一轮被人工拒绝、要求停下，否则回模型继续。"""
+    return "end" if state.get("halt") else "agent"
+
+
 def build_graph(
     *,
     model: BaseChatModel,
@@ -107,5 +112,5 @@ def build_graph(
     builder.add_edge("compress", "agent")
     builder.add_conditional_edges("agent", _route, {"tools": "approve", "end": END})
     builder.add_edge("approve", "tools")
-    builder.add_edge("tools", "agent")
+    builder.add_conditional_edges("tools", _route_after_tools, {"agent": "agent", "end": END})
     return builder.compile(checkpointer=checkpointer)

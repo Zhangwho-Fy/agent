@@ -116,6 +116,38 @@ async def test_denied_approval_leaves_the_workspace_untouched(tmp_path: Path) ->
     assert "未执行" in denial.data["preview"], "要把拒绝原因回填给模型"
 
 
+async def test_denied_approval_stops_the_turn(tmp_path: Path) -> None:
+    """拒绝之后**这一轮直接停**：不该再叫模型"换个命令再问一次"。
+
+    用户的原话：拒绝了它还在思考、一直问我。所以这里不靠提示词劝模型住手——
+    路由直接走到 END，模型根本不会被叫第二次。
+    """
+    model = ScriptedModel([write_reply(), AIMessage(content="我再试一次")])
+    graph, emitter, events = build(tmp_path, model)
+
+    async def approver(requests: list[dict[str, Any]]) -> dict[str, bool]:
+        return {request["call_id"]: False for request in requests}
+
+    result = await stream_turn(
+        graph=graph,
+        prompt="写个文件",
+        emitter=emitter,
+        session_id="sess_t",
+        turn_id="turn_1",
+        approver=approver,
+        approval_timeout_s=5,
+    )
+
+    assert model.calls == 1, "拒绝之后模型不该被再叫一次"
+    assert result.status == "stopped"
+    assert "已停下" in result.text
+    assert any(
+        event.type.value == "text.delta" and "已停下" in event.data["text"] for event in events
+    ), "这句话要能被界面画出来（text.done 界面上不重画）"
+    done = next(event for event in events if event.type.value == "turn.done")
+    assert done.data["status"] == "stopped"
+
+
 async def test_timeout_counts_as_denied(tmp_path: Path) -> None:
     model = ScriptedModel([write_reply(), AIMessage(content="好")])
     graph, emitter, _ = build(tmp_path, model)

@@ -44,7 +44,12 @@ class Settings(BaseSettings):
 
     # ---- 工作区与执行限制 ----
     workspace: Path = Field(default=Path("."), description="code profile 的工作区根目录")
-    max_tool_rounds: int = Field(default=12, ge=1, le=100, description="单轮最多几次工具往返")
+    max_tool_rounds: int = Field(
+        default=40,
+        ge=1,
+        le=100,
+        description="单轮最多几次工具往返（一次往返 = 模型要工具 → 执行 → 回模型）",
+    )
     tool_timeout_s: float = Field(default=60.0, gt=0, description="单个工具超时（秒）")
     output_limit_bytes: int = Field(default=8192, ge=256, description="工具输出进上下文的截断阈值")
     approval_timeout_s: float = Field(default=120.0, gt=0, description="审批等待上限，超时视为拒绝")

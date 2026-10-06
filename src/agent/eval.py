@@ -101,6 +101,7 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
     from .core.bus import EventBus
     from .core.events import Event
     from .core.reliability import EventEmitter
+    from .graph.bridge import recursion_limit_for as _recursion_limit_for
     from .graph.bridge import stream_turn
     from .graph.builder import build_graph
     from .graph.checkpointer import open_checkpointer
@@ -148,6 +149,7 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
             turn_id="turn_eval",
             approver=approver,
             approval_timeout_s=5,
+            recursion_limit=_recursion_limit_for(settings.max_tool_rounds),
         )
 
     tools = [str(event.data.get("name", "")) for event in events if event.type.value == "tool.call"]

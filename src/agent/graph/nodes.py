@@ -212,6 +212,7 @@ def build_tool_node(
         approvals = state.get("approvals") or {}
         turn_id = state.get("turn_id") or None
         results: list[AnyMessage] = []
+        halt: dict[str, Any] | None = None
         # 这一批是第几次工具往返。同上，是给客户端和状态块看的硬上限计数。
         round_no = (state.get("tool_rounds") or 0) + 1
         stats: dict[str, dict[str, int]] = {
@@ -261,6 +262,10 @@ def build_tool_node(
             refusal = _refusal_reason(decision, bool(approvals.get(call_id)))
             if refusal is not None:
                 count(name, failed=True)
+                if decision.decision is Decision.APPROVAL and not approvals.get(call_id):
+                    # 人工拒绝（或没人可问）：**这一轮到此为止**。
+                    # 不这么做的话，模型会拿着"未获批准"换一条命令再问一次，变成一直弹审批。
+                    halt = {"call_id": call_id, "name": name, "reason": decision.reason}
                 results.append(ToolMessage(content=refusal, tool_call_id=call_id))
                 await emitter.emit(
                     EventType.TOOL_RESULT,
@@ -330,6 +335,7 @@ def build_tool_node(
             "messages": results,
             "tool_rounds": (state.get("tool_rounds") or 0) + 1,
             "tool_stats": stats,
+            "halt": halt,
             "approvals": {},  # 本批用完了，清空，别影响下一批
         }
 

@@ -309,7 +309,8 @@ async def test_approval_blocks_a_write_until_the_client_decides(tmp_path: Path) 
             await client.approve(session_id, str(request.data["call_id"]), granted=False)
 
             done = await wait_for_event(app.state.agent.db, session_id, turn_done(sent["turn_id"]))
-            assert done.data["status"] == "done"
+            # 人工拒绝 = 这一轮直接停（不再让模型换条命令再问一次）
+            assert done.data["status"] == "stopped"
             assert not (workspace / "notes.txt").exists(), "拒绝了就不能动文件"
 
             events = [
@@ -337,7 +338,7 @@ async def test_approval_timeout_counts_as_denied(tmp_path: Path) -> None:
                 session_id, "在工作区根目录创建一个 notes.txt，内容写 hello"
             )
             done = await wait_for_event(app.state.agent.db, session_id, turn_done(sent["turn_id"]))
-            assert done.data["status"] == "done"
+            assert done.data["status"] == "stopped", "没人应答也算这一轮停住"
             assert not (workspace / "notes.txt").exists()
         finally:
             await client.close()

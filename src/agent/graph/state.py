@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
@@ -25,3 +25,5 @@ class AgentState(TypedDict, total=False):
     tool_stats: dict[str, dict[str, int]]
     #: 上一次模型调用实际塞进上下文的 token 数——上下文占用估算的锚点
     context_tokens: int
+    #: 人工拒绝审批后要求停下这一轮：{call_id, name, reason}
+    halt: dict[str, Any] | None

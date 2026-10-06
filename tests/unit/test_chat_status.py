@@ -480,14 +480,26 @@ def test_approval_lines_show_what_will_run() -> None:
     lines = approval_lines(
         {"name": "shell_exec", "args": {"command": "uv run pytest -q"}, "reason": "写操作"}
     )
-    assert lines[0] == "⚠ 需要确认：shell_exec"
-    assert lines[1] == "  uv run pytest -q"
-    assert "写操作" in lines[2]
-    assert "回车" in lines[-1], "得写清楚回车=拒绝"
+    assert lines[0] == "⚠ 需要确认  shell_exec"
+    assert lines[1] == "  命令  uv run pytest -q"
+    assert lines[2].startswith("  原因") and "写操作" in lines[2]
+    assert "回车 允许" in lines[-1], "回车是允许，不是拒绝"
 
     other = approval_lines({"name": "fs_write", "args": {"path": "a.py"}})
-    assert other[1] == '  {"path": "a.py"}'
+    assert other[1] == '  命令  {"path": "a.py"}'
     assert len(other) == 3, "没有 reason 就不占一行"
+
+
+def test_approval_lines_stay_readable_for_a_huge_command() -> None:
+    """审批要看清，但也不能糊一屏：逐行裁宽度、整体压行数，裁了多少写清楚。"""
+    from agent.client.main import approval_lines
+
+    command = "\n".join(f"echo 第{index}行" + "很长" * 40 for index in range(30))
+    lines = approval_lines({"name": "shell_exec", "args": {"command": command}}, width=60)
+
+    assert len(lines) <= 12
+    assert "只显示前" in "".join(lines), "裁掉了就得说出来，不能装作没裁"
+    assert "回车 允许" in lines[-1]
 
 
 def test_prompt_tells_you_when_it_is_asking() -> None:
@@ -507,14 +519,14 @@ def test_prompt_tells_you_when_it_is_asking() -> None:
     ), "换文案不能让输入行整体挪位"
 
 
-async def test_confirm_y_n_and_ctrl_c() -> None:
-    """y 放行、回车/N 拒绝、Ctrl-C 表示"我要走"。"""
+async def test_confirm_enter_allows_and_n_rejects() -> None:
+    """回车放行（和 Codex 一致）；N 拒绝；Ctrl-C 表示"我要走"。"""
     tui = ChatTUI(ChatStatus())
 
-    tui._lines.put_nowait("y")
-    assert await tui.confirm() is True
     tui._lines.put_nowait("")
-    assert await tui.confirm() is False, "直接回车必须按拒绝算"
+    assert await tui.confirm() is True
+    tui._lines.put_nowait("y")
+    assert await tui.confirm() is True, "y 仍然认，别把老习惯弄丢"
     tui._lines.put_nowait("N")
     assert await tui.confirm() is False
     tui._lines.put_nowait(None)

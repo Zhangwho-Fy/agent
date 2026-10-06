@@ -533,19 +533,50 @@ LINE_CLASS = {
 PROCESS_KINDS = frozenset({"tool", "reason"})
 
 
-def approval_lines(data: dict[str, Any]) -> list[str]:
+#: 审批块里的标签列宽（"命令" / "原因" 都是 4 列中文）
+_APPROVAL_LABEL = 4
+
+#: 审批块最多摊开几行命令。超了给明确省略标记——完整内容永远在事件里
+#: （`agent replay <会话>` 能看到全文），屏幕上一屏糊满反而看不清要批什么。
+_APPROVAL_MAX_LINES = 8
+
+
+def approval_lines(
+    data: dict[str, Any], *, width: int = 100, max_lines: int = _APPROVAL_MAX_LINES
+) -> list[str]:
     """审批提示的几行纯文本（样式由界面统一给）。
 
-    `shell_exec` 这类单参数工具直接把命令摊开——审批的意义就是让人看清要跑什么。
+    这里要同时满足两件冲突的事：**让人看清要跑什么** 和 **别糊一屏**。取舍：
+
+    - 命令逐行摊开（`shell_exec` 不用自己去解 JSON），但每行裁到终端宽度、
+      整体最多 `max_lines` 行；裁掉多少写清楚，不装作没裁。
+    - 标签列对齐，答复提示放在**最后一行**，紧贴输入框。
+    - "怎么答"同时常驻底栏（`_status_fragments`），滚动时也看得见。
     """
     args = data.get("args") or {}
     detail = args.get("command") if isinstance(args, dict) else None
     if not detail:
         detail = json.dumps(args, ensure_ascii=False)
-    lines = [f"⚠ 需要确认：{data.get('name')}", f"  {detail}"]
+    detail = str(detail)
+
+    limit = max(20, width - _APPROVAL_LABEL - 2)
+    raw_lines = detail.splitlines() or [""]
+
+    def row(label: str, text: str) -> str:
+        """标签列对齐：`命令` / `原因` / 续行都从同一列开始。"""
+        return f"  {_fit(label, _APPROVAL_LABEL)}  {_fit(text, limit).rstrip()}"
+
+    lines = [f"⚠ 需要确认  {data.get('name')}"]
+    for index, raw in enumerate(raw_lines[:max_lines]):
+        lines.append(row("命令" if index == 0 else "", raw))
+    if len(raw_lines) > max_lines:
+        lines.append(
+            f"  {' ' * _APPROVAL_LABEL}  …（命令共 {len(raw_lines)} 行 / {len(detail)} 字符，"
+            f"只显示前 {max_lines} 行；全文见 agent replay）"
+        )
     if data.get("reason"):
-        lines.append(f"  原因：{data['reason']}")
-    lines.append("  y 放行 · 回车或 n 拒绝 · 超时按拒绝")
+        lines.append(row("原因", str(data["reason"])))
+    lines.append("  回车 允许 · n 拒绝 · 超时按拒绝")
     return lines
 
 
@@ -1000,6 +1031,9 @@ class ChatTUI:
             lead = ("class:bar.idle", " ● 空闲 ")
         # 徽标补到固定宽度：不然"空闲"和"执行 fs_read"一换，后面全跟着平移
         fragments = [(lead[0], _fit(lead[1], 20)), *self.status.segments(aligned=True)]
+        if self._asking:
+            # 「怎么答」常驻底栏：日志滚上去之后，不用再回去找那一行
+            fragments.append(("class:bar.warn", " · 回车 允许 / n 拒绝"))
         if self._scroll:
             fresh = len(self._log) - len(self._frozen) if self._frozen is not None else 0
             hint = f" │ ↑ 浏览历史 {self._scroll} 行"
@@ -1186,8 +1220,11 @@ class ChatTUI:
         """在界面里问一句：放行还是拒绝。
 
         返回 `True` 放行、`False` 拒绝、`None` 表示用户按了 Ctrl-C（他要走）。
-        **默认是拒绝**：直接回车、按 n、或者答非所问地打了别的内容，都不会放行；
-        打成消息的那种会先寄存起来（`_deferred`），不吞掉用户打的字。
+
+        **回车 = 允许**（和 Codex 一致，一次按键就够）。协议里的"默认拒绝"说的是
+        **拿不到答复**的情况——超时、没有审批通道、Ctrl-C——那些仍然一律不放行。
+        打了别的内容不算答复：那多半是用户想说的话，先寄存起来（`_deferred`），
+        不吞掉他打的字。
         """
         self._asking = True
         self.refresh()
@@ -1198,12 +1235,12 @@ class ChatTUI:
                 if raw is None:
                     return None
                 answer = raw.strip().lower()
-                if answer in {"y", "yes", "是", "允许"}:
+                if not answer or answer in {"y", "yes", "是", "允许"}:
                     return True
-                if not answer or answer in {"n", "no", "否", "拒绝"}:
+                if answer in {"n", "no", "否", "拒绝"}:
                     return False
                 self._deferred.append(raw)  # 这是用户想说的话，不是答案
-                self.write("这里是问 y/n：y 放行、回车或 n 拒绝（你那句话等这轮完再发）\n", "warn")
+                self.write("这里在问审批：回车允许、n 拒绝（你那句话等这轮完再发）\n", "warn")
         finally:
             self._asking = False
             self.refresh()
@@ -2021,7 +2058,7 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                         last_seq = event.seq
                         kind = event.type.value
                         if kind == "approval.required":
-                            # 在界面上直接问：y 放行 / 回车拒绝 / Ctrl-C 连人带会话一起走
+                            # 在界面上直接问：回车放行 / n 拒绝 / Ctrl-C 连人带会话一起走
                             granted: bool | None = (
                                 True if auto_approve else await _ask_in_tui(tui, status, event.data)
                             )
@@ -2099,7 +2136,7 @@ async def _ask_in_tui(tui: ChatTUI, status: ChatStatus, data: dict[str, Any]) ->
 
     返回 `True` 放行、`False` 拒绝、`None` 表示用户按了 Ctrl-C 要走。
     """
-    for line in approval_lines(data):
+    for line in approval_lines(data, width=tui.app.output.get_size().columns):
         tui.write(line + "\n", "warn")
     status.set_phase("等待确认")
     tui.refresh()

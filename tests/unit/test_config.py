@@ -19,7 +19,7 @@ def test_defaults_match_design() -> None:
     assert settings.provider == "deepseek"
     assert settings.model == "deepseek-v4-flash"
     assert settings.base_url == "https://api.deepseek.com"
-    assert settings.max_tool_rounds == 12
+    assert settings.max_tool_rounds == 40
     assert settings.output_limit_bytes == 8192
     assert settings.host == "127.0.0.1"
 

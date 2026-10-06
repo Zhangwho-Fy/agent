@@ -76,6 +76,7 @@ async def stream_turn(
         "rounds": 0,
         "tool_rounds": 0,
         "tool_stats": {},
+        "halt": None,
         "turn_id": turn_id,
         "approvals": {},
     }
@@ -90,6 +91,7 @@ async def stream_turn(
     fallback_text = ""
     usage: dict[str, int] = {}
     status = "done"
+    halt: dict[str, Any] | None = None
     pending: Any = inputs
 
     try:
@@ -125,6 +127,8 @@ async def stream_turn(
                     node_update = node_update or {}
                     if node_update.get("usage") is not None:
                         usage = node_update["usage"]
+                    if node_update.get("halt"):
+                        halt = node_update["halt"]
                     for message in node_update.get("messages") or []:
                         content = getattr(message, "content", "")
                         if (
@@ -137,7 +141,7 @@ async def stream_turn(
 
             if not suspended:
                 break
-            decisions = await _resolve_approvals(
+            decisions, approval_note = await _resolve_approvals(
                 suspended,
                 emitter=emitter,
                 turn_id=turn_id,
@@ -154,6 +158,19 @@ async def stream_turn(
         )
 
     final_text = "".join(text_parts) or fallback_text
+    if halt:
+        # 审批没过 = 这一轮就停在这儿。用 text.delta 发出去，界面才会画出来
+        # （text.done 只给非流式消费者和回放看）。说清是"人拒绝"还是"没人应答"——
+        # 超时/没通道的时候不该冤枉成"你拒绝了"。
+        note = (
+            f"\n已停下：{halt.get('name')} 需要人工确认，但{approval_note}。\n"
+            if approval_note
+            else f"\n已停下：你拒绝了 {halt.get('name')}，这一轮不再继续。"
+            "要换个做法，直接说一句就行。\n"
+        )
+        await emitter.emit(EventType.TEXT_DELTA, {"text": note}, turn_id=turn_id)
+        final_text = f"{final_text}{note}"
+        status = "stopped"
     duration_ms = int((time.perf_counter() - started) * 1000)
     await emitter.emit(EventType.TEXT_DONE, {"text": final_text, "usage": usage}, turn_id=turn_id)
     await emitter.emit(
@@ -176,11 +193,14 @@ async def _resolve_approvals(
     turn_id: str,
     approver: Approver | None,
     timeout_s: float,
-) -> dict[str, bool]:
+) -> tuple[dict[str, bool], str]:
     """把挂起原因翻译成 `approval.required` 事件，拿到决策。
 
     **拿不到决策一律按拒绝**：没人可问、超时、回调自己报错，都是"不放行"。
     审批这种地方默认值必须是拒绝，不能是放行。
+
+    返回 `(决策, 为什么没拿到决策)`——第二个值只在"不是人拒绝的"时候非空
+    （超时 / 没通道 / 回调出错），调用方用来说清这一轮为什么停下，别冤枉用户。
     """
     requests: list[dict[str, Any]] = []
     for item in suspended or ():
@@ -188,7 +208,7 @@ async def _resolve_approvals(
         requests.extend(value.get("requests") or [])
 
     if not requests:
-        return {}
+        return {}, ""
 
     expires_at = (datetime.now(UTC) + timedelta(seconds=timeout_s)).isoformat(timespec="seconds")
     for request in requests:
@@ -201,22 +221,22 @@ async def _resolve_approvals(
     denied = {request["call_id"]: False for request in requests}
     if approver is None:
         logger.warning("有待审批的调用但没有审批通道，按拒绝处理：%s", list(denied))
-        return denied
+        return denied, "当时没有审批通道"
 
     try:
         async with asyncio.timeout(timeout_s):
             granted = await approver(requests)
     except TimeoutError:
         logger.warning("审批超时（%ss），按拒绝处理：%s", timeout_s, list(denied))
-        return denied
+        return denied, f"等了 {timeout_s:g} 秒没人应答"
     except Exception:
         logger.exception("审批回调出错，按拒绝处理")
-        return denied
+        return denied, "审批通道出错了"
 
     if isinstance(granted, bool):
-        return {request["call_id"]: granted for request in requests}
+        return {request["call_id"]: granted for request in requests}, ""
     if isinstance(granted, dict):
         return {
             request["call_id"]: bool(granted.get(request["call_id"], False)) for request in requests
-        }
-    return denied
+        }, ""
+    return denied, "答复的形状无法识别"
