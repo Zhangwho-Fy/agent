@@ -98,7 +98,8 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 ## 文档
 
 设计文档（`docs/design.md`，含事件与 HTTP 契约、上下文工程、用户记忆与 RAG、评测体系，
-以及 D1 ~ D66 决策记录）、图文版（`docs/context-engineering.html`，**三页**：
-① 上下文工程 ② 用户记忆与 RAG ③ 评测体系）和**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
+以及 D1 ~ D66 决策记录）、图文版（`docs/context-engineering.html`，**五页**：
+① 上下文工程 ② 用户记忆与 RAG ③ 评测体系 ④ 架构与一次调用 ⑤ 数据与上下文）和
+**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
 代码地图、踩过的坑）都是**本地文档**，已从版本控制移除——克隆这个仓库不会有它们，
 仓库里只有代码、测试和这份 README。
