@@ -1,7 +1,7 @@
 """系统提示词（L1 / L2）的护栏测试。
 
 提示词是代码，改它要有回归。这里钉住的是**不许悄悄丢掉的条款**，不是逐字文案——
-文案可以改，条款不行。理由见 `docs/context-engineering.md` 第 2 节。
+文案可以改，条款不行。理由见 `docs/design.md` 第 7.1 节。
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """技能测试：目录渲染的安全边界、按轮冻结的刷新策略、两个工具的边界。
 
-对应 docs/context-engineering.md 第 3 节的验收表。
+对应 docs/design.md 第 7.2 节的验收表。
 """
 
 from __future__ import annotations

@@ -58,7 +58,7 @@ class Settings(BaseSettings):
         description="模型上下文窗口（token），只用于交互式状态栏显示占用比例",
     )
 
-    # ---- 上下文压缩（docs/context-engineering.md 第 5 节）----
+    # ---- 上下文压缩（docs/design.md 第 7.5 节）----
     compress_enabled: bool = Field(
         default=True, description="打开上下文压缩；评测与回放建议关掉，保证确定性"
     )

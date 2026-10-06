@@ -1,6 +1,6 @@
 """压缩：阶梯选择、指针化、摘要、找回通道。
 
-对应 docs/context-engineering.md 第 5 节的验收表。
+对应 docs/design.md 第 7.5 节的验收表。
 """
 
 from __future__ import annotations

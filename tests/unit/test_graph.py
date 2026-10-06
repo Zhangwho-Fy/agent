@@ -453,7 +453,7 @@ async def test_turn_done_carries_token_usage(tmp_path: Path) -> None:
     )
 
     done = next(event for event in events if event.type.value == "turn.done")
-    # 形状按 detailed-design 4.2 的约定：turn.done 带 usage 与 duration_ms
+    # 形状按 design.md 第 4.2 节的约定：turn.done 带 usage 与 duration_ms
     assert done.data["usage"]["input_tokens"] == 12
     assert done.data["usage"]["output_tokens"] == 7
     assert done.data["duration_ms"] >= 0

@@ -1,6 +1,6 @@
 """上下文压缩的纯逻辑：阶梯、指针化、摘要请求。
 
-设计见 `docs/context-engineering.md` 第 5 节。这里只做**纯计算**，不碰图、不调模型、
+设计见 `docs/design.md` 第 7.5 节。这里只做**纯计算**，不碰图、不调模型、
 不落库——节点在 `graph/compress.py`，找回通道在 `tools/recall.py`。
 
 ### 相对设计文档的一处修正

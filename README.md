@@ -6,7 +6,7 @@
 
 ## 现在能做什么
 
-- **真读真跑**：三个工具（`fs_read` / `fs_list` / `shell_exec`），模型自己决定调哪个、调几次，结果回填后继续推理
+- **真读真跑**：六个工具（`fs_read` / `fs_list` / `shell_exec` / `recall` / `skill_load` / `skill_create`），模型自己决定调哪个、调几次，结果回填后继续推理
 - **分级管控**：只读命令自动执行；有副作用的命令挂起等你点头；危险命令（`rm -rf`、`sudo`、`git push`…）直接拒绝，并把原因回填给模型让它换做法
 - **会话持久化**：事件、消息、工具调用、审批、token 用量全部落 SQLite
 - **崩溃恢复**：跑到一半 `kill -9`，重启后把没跑完的 turn 标成 `interrupted`，同一会话可以接着聊
@@ -15,6 +15,7 @@
 - **服务化**：`agent serve` 提供 HTTP + SSE（任务在服务端跑，客户端只是订阅者），断线重连按 `Last-Event-ID` 补齐；`agent chat` 是配套的交互式 CLI
 - **交互式界面**：`agent chat` 是全屏常驻界面（状态栏 + 输入行钉在最底，日志在内滚动）；思考过程暗灰可折叠、代码高亮、写操作当场问你、`agent resume` 挑历史会话并先把历史画出来
 - **代码检索**：切块 + FTS5 词法 + 向量语义 + RRF 混合排序，10 条查询 **recall@5 = 90%、MRR = 0.717**（离线跑，不联网；这个数只当回归基线）
+- **上下文工程**：系统提示词分静态核心 + 会话环境两层；外部内容统一打来源标记（`<untrusted>`），只有技能正文是操作说明（`<skill>`）；技能目录渐进式披露（目录进系统提示、正文按需加载）；模型每轮看到一张"还剩多少预算"的状态块；上下文到 60% 把旧工具结果换成指针（原文可用 `recall` 取回），到 80% 才做结构化摘要
 - **CI**：每次 push 自动跑 ruff + pytest，全程不注入密钥
 
 ## 快速开始
@@ -25,7 +26,7 @@
 # 没有 uv 就先装：curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync                     # 建 .venv；国内网络慢时加 UV_HTTP_TIMEOUT=300
                             # 系统只有 3.13/3.14 时用 uv sync --python 3.12
-cp .env.example .env        # 填入 AGENT_API_KEY，该文件不进 git
+cp .env.example .env        # 填入 AGENT_API_KEY；服务端/客户端共用的令牌写 AGENT_AUTH_TOKEN
 uv run agent doctor         # 体检：Python、依赖、配置、密钥
 
 # 跑一个真实任务
@@ -34,9 +35,9 @@ uv run agent run "用一句话说明 src/agent/graph/builder.py 里的图是怎�
 uv run agent run -s <会话 id> "那个文件的异常处理是怎么做的？"
 
 # 交互式：一个终端跑服务端，另一个终端聊天
-uv run agent serve                 # 打印访问令牌
-uv run agent chat --token <令牌>    # 多轮对话（全屏界面），写操作会停下来问你
-uv run agent resume --token <令牌>  # 列出历史会话，挑一个继续（历史先画出来）
+uv run agent serve                 # 没配 AGENT_AUTH_TOKEN 时会随机生成一个并打印
+uv run agent chat                  # 多轮对话（全屏界面），写操作停下来问你：回车允许 / n 拒绝
+uv run agent resume                # 列出历史会话，挑一个继续（历史先画出来）
 ```
 
 ## 命令
@@ -80,12 +81,14 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 | 3 工程化（录放、golden 集、CI） | ✅ |
 | 4 服务化（HTTP + SSE、断线续传、幂等、交互式 CLI） | ✅ |
 | 5 检索（切块、混合检索、recall@5 评测） | ✅ |
+| 上下文工程（提示词分层、技能、状态块、压缩） | ✅ |
 | 6 扩展（MCP 适配器、可选 C++ 工具） | 暂缓：没有真实需求前不引入（MCP 的价值是接第三方生态，代价是沙箱语义变弱） |
 
 编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。
 
 ## 文档
 
-设计文档、接口契约（`docs/protocol.md`）和**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
-代码地图、设计决定、踩过的坑）都是**本地文档**，已从版本控制移除——克隆这个仓库不会有它们，
-仓库里只有代码、测试和这份 README。
+设计文档（`docs/design.md`，含事件与 HTTP 契约、上下文工程与 D1~D34 决策记录）、
+上下文工程的图文版（`docs/context-engineering.html`）和**交接文档**（`AGENTS.md`：当前状态、
+换机器继续的步骤、代码地图、踩过的坑）都是**本地文档**，已从版本控制移除——克隆这个仓库
+不会有它们，仓库里只有代码、测试和这份 README。
