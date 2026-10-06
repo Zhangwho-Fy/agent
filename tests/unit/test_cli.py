@@ -33,6 +33,9 @@ def test_placeholder_key_is_flagged() -> None:
     assert _looks_like_placeholder("sk-your-key-here")
     assert _looks_like_placeholder("sk-xxxxxxxxxxxxxxxxxxxx")
     assert _looks_like_placeholder("短key")
+    # 注意：这里**不能**写真实 key 的样例。曾经有人把真 key 粘进来当测试样例，
+    # 结果它跟着仓库推到了公开的 GitHub 上，被爬走刷掉了余额。
+    # 用这个"够长、又不是占位符、也不是任何真实密钥形态"的假值就够了。
     assert not _looks_like_placeholder("sk-test-fixture-not-a-real-key")
     assert not _looks_like_placeholder(""), "空值是另一条路（未设置），别报两次"
 
