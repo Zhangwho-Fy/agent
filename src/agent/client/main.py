@@ -119,9 +119,10 @@ class ChatStatus:
     context_limit: int = 0
     phase: str = ""
     frame: int = 0
-    #: 本轮工具调用次数与上限，以及"同一个工具调了几次"的告警（第 4 节）。
+    #: 本轮的**工具往返**次数（不是单次工具调用：一批里调三个工具也只算一次往返）
+    #: 与上限，以及"同一个工具被反复调用"的告警（第 4 节）。
     #: 全部由事件本地计数——和给模型的状态块同源，但**渲染是两份**（4.6）。
-    tool_calls: int = 0
+    tool_rounds: int = 0
     tool_limit: int = 0
     repeat: str = ""
     _tool_counts: dict[str, int] = field(default_factory=dict, repr=False)
@@ -134,13 +135,18 @@ class ChatStatus:
 
     def begin_turn(self) -> None:
         """新一轮开始：工具计数归零——它数的是"这一轮"，不是整个会话。"""
-        self.tool_calls = 0
+        self.tool_rounds = 0
         self.repeat = ""
         self._tool_counts = {}
 
-    def count_tool(self, name: str) -> None:
-        """记一次工具调用。调用次数 ≥2 时底栏亮出重复告警（人也要能看见）。"""
-        self.tool_calls += 1
+    def count_tool(self, name: str, *, round_no: int | None = None) -> None:
+        """记一次工具调用。
+
+        `round_no` 由服务端给（`tool.call` 事件里的 `round`）——**往返次数必须用服务端的数**，
+        否则一批里调三个工具，客户端会数成 3，而真正的硬上限只走了 1。
+        老服务端不带这个字段时退化成"见了 tool.call 就 +1"。
+        """
+        self.tool_rounds = round_no if round_no is not None else self.tool_rounds + 1
         self._tool_counts[name] = self._tool_counts.get(name, 0) + 1
         worst = max(self._tool_counts.items(), key=lambda item: item[1])
         self.repeat = f"{worst[0]}×{worst[1]}" if worst[1] >= 2 else ""
@@ -186,9 +192,9 @@ class ChatStatus:
             used += f"/{self.context_limit}（{percent}）"
 
         tools = (
-            f"工具 {self.tool_calls:>2}/{self.tool_limit}"
+            f"工具往返 {self.tool_rounds:>2}/{self.tool_limit}"
             if self.tool_limit
-            else f"工具 {self.tool_calls:>2}"
+            else f"工具往返 {self.tool_rounds:>2}"
         )
 
         segments = [
@@ -2033,7 +2039,11 @@ async def _loop_tui(client: Any, session_id: str, status: ChatStatus, auto_appro
                             continue
                         if kind == "tool.call":
                             status.set_phase(f"执行 {event.data.get('name')}")
-                            status.count_tool(str(event.data.get("name", "")))
+                            raw_round = event.data.get("round")
+                            status.count_tool(
+                                str(event.data.get("name", "")),
+                                round_no=int(raw_round) if raw_round is not None else None,
+                            )
                         elif kind == "tool.result":
                             status.set_phase("思考中")
                         elif kind == "reasoning.delta":

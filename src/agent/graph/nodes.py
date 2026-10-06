@@ -212,6 +212,8 @@ def build_tool_node(
         approvals = state.get("approvals") or {}
         turn_id = state.get("turn_id") or None
         results: list[AnyMessage] = []
+        # 这一批是第几次工具往返。同上，是给客户端和状态块看的硬上限计数。
+        round_no = (state.get("tool_rounds") or 0) + 1
         stats: dict[str, dict[str, int]] = {
             name: dict(value) for name, value in (state.get("tool_stats") or {}).items()
         }
@@ -227,7 +229,8 @@ def build_tool_node(
             args = dict(call.get("args") or {})
             call_id = str(call.get("id", ""))
             await emitter.emit(
-                EventType.TOOL_CALL, {"call_id": call_id, "name": name, "args": args}
+                EventType.TOOL_CALL,
+                {"call_id": call_id, "name": name, "args": args, "round": round_no},
             )
 
             tool = registry.get(name)

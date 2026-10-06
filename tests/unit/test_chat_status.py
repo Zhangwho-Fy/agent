@@ -60,27 +60,40 @@ def test_chat_needs_a_real_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_tool_counter_and_repeat_warning_show_in_the_bar() -> None:
-    """人也要看得见"这一轮用了几个工具""是不是在同一个工具上打转"（4.6）。"""
+    """人也要看得见"这一轮走了几次工具往返""是不是在同一个工具上打转"（4.6）。"""
     status = ChatStatus(model="m", session_id="sess_1", tool_limit=12)
     status.begin_turn()
 
-    status.count_tool("fs_read")
-    assert "工具  1/12" in _plain(status)
+    status.count_tool("fs_read", round_no=1)
+    assert "工具往返  1/12" in _plain(status)
     assert "⚠" not in _plain(status), "第一次调用只是正常往返，不该报警"
 
-    status.count_tool("fs_read")
+    status.count_tool("fs_read", round_no=2)
     assert "⚠ fs_read×2" in _plain(status)
+
+
+def test_tool_count_uses_the_server_round_not_the_call_count() -> None:
+    """一批里调三个工具只算一次往返——数字要跟服务端的硬上限一致。"""
+    status = ChatStatus(model="m", session_id="sess_1", tool_limit=12)
+    status.begin_turn()
+
+    status.count_tool("fs_read", round_no=1)
+    status.count_tool("fs_list", round_no=1)
+    status.count_tool("shell_exec", round_no=1)
+
+    assert "工具往返  1/12" in _plain(status)
+    assert "⚠" not in _plain(status), "同一批里三个不同工具不算重复"
 
 
 def test_begin_turn_resets_tool_counters() -> None:
     status = ChatStatus(model="m", session_id="sess_1", tool_limit=12)
-    status.count_tool("fs_read")
-    status.count_tool("fs_read")
+    status.count_tool("fs_read", round_no=1)
+    status.count_tool("fs_read", round_no=2)
 
     status.begin_turn()
 
     text = _plain(status)
-    assert "工具  0/12" in text
+    assert "工具往返  0/12" in text
     assert "⚠" not in text
 
 
