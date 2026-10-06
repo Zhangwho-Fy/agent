@@ -103,12 +103,9 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
     from .core.reliability import EventEmitter
     from .graph.bridge import recursion_limit_for as _recursion_limit_for
     from .graph.bridge import stream_turn
-    from .graph.builder import build_graph
     from .graph.checkpointer import open_checkpointer
+    from .graph.wiring import build_session_graph
     from .models.factory import build_chat_model
-    from .tools.base import ToolContext
-    from .tools.policy import Policy
-    from .tools.registry import default_registry
 
     workspace = (repo_root / case.workspace).resolve()
     trace = case.trace if case.trace.is_absolute() else (repo_root / case.trace)
@@ -125,18 +122,16 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
     emitter.on_event = events.append
 
     with tempfile.TemporaryDirectory() as tmp:
-        graph = build_graph(
+        wiring = build_session_graph(
+            settings,
+            workspace=workspace,
             model=build_chat_model(settings),
-            registry=default_registry(),
-            policy=Policy(workspace),
-            ctx=ToolContext(workspace=workspace),
             emitter=emitter,
-            max_tool_rounds=settings.max_tool_rounds,
-            context_limit=settings.context_limit,
             # 评测要确定性：压缩会改写消息序列，把录放夹具打乱（D32）
             compress_enabled=False,
             checkpointer=open_checkpointer(Path(tmp) / "ckpt.db"),
         )
+        graph = wiring.graph
 
         async def approver(requests: list[dict[str, Any]]) -> dict[str, bool]:
             return {request["call_id"]: case.approve for request in requests}

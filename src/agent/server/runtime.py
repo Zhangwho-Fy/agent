@@ -20,13 +20,10 @@ from ..config import Settings
 from ..core.bus import EventBus
 from ..core.reliability import EventEmitter
 from ..graph.bridge import TurnResult, recursion_limit_for, stream_turn
-from ..graph.builder import build_graph
+from ..graph.wiring import build_session_graph
 from ..models.factory import build_chat_model
 from ..store import repo
 from ..store.db import Database
-from ..tools.base import ToolContext
-from ..tools.policy import Policy
-from ..tools.registry import default_registry
 
 
 class SessionRuntime:
@@ -50,14 +47,6 @@ class SessionRuntime:
         self.lock = asyncio.Lock()  # 同一会话串行
         self._pending: dict[str, asyncio.Future[bool]] = {}
 
-        ctx = ToolContext(
-            workspace=Path(workspace).expanduser().resolve(),
-            timeout_s=settings.tool_timeout_s,
-            output_limit_bytes=settings.output_limit_bytes,
-            db=db,
-        )
-        policy = Policy(ctx.workspace)
-        registry = default_registry()
         # 事件先落库、再推送：顺序反了会出现"客户端看到过、事后查不到"
         self.emitter = EventEmitter(
             session_id,
@@ -65,21 +54,15 @@ class SessionRuntime:
             start_seq=start_seq,
             sink=lambda event: repo.append_event(db, event),
         )
-        self.graph = build_graph(
+        self.wiring = build_session_graph(
+            settings,
+            workspace=Path(workspace).expanduser().resolve(),
             model=build_chat_model(settings),
-            registry=registry,
-            policy=policy,
-            ctx=ctx,
             emitter=self.emitter,
-            max_tool_rounds=settings.max_tool_rounds,
-            context_limit=settings.context_limit,
-            compress_enabled=settings.compress_enabled,
-            compress_lossless_ratio=settings.compress_lossless_ratio,
-            compress_summary_ratio=settings.compress_summary_ratio,
-            compress_keep_recent=settings.compress_keep_recent_tool_results,
             checkpointer=checkpointer,
             db=db,
         )
+        self.graph = self.wiring.graph
 
     async def run_turn(self, prompt: str, *, turn_id: str) -> TurnResult:
         """跑一轮。调用方负责把它的返回值落库（或用返回的 usage 更新 turn 行）。"""

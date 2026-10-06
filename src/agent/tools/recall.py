@@ -9,7 +9,6 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from ..core.tool_spec import Tier
-from ..store import repo
 from .base import Tool, ToolContext, ToolResult, truncate
 
 
@@ -18,9 +17,9 @@ class RecallArgs(BaseModel):
 
 
 async def recall(args: RecallArgs, ctx: ToolContext) -> ToolResult:
-    if ctx.db is None:
+    if ctx.fetch_tool_call is None:
         return ToolResult(ok=False, content="这个运行没有接会话库，取不回原文")
-    row = await repo.get_tool_call(ctx.db, args.call_id)
+    row = await ctx.fetch_tool_call(args.call_id)
     if row is None:
         return ToolResult(ok=False, content=f"没有这条工具调用记录：{args.call_id}")
     original = row["result"]

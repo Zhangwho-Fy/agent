@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from agent.client.main import ChatStatus, ChatTUI
+from agent.client.tui import ChatTUI
+from agent.client.ui import ChatStatus
 
 
 def _plain(status: ChatStatus) -> str:
@@ -49,7 +50,7 @@ def test_status_without_context_limit_still_reads_well() -> None:
 
 def test_chat_needs_a_real_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     """非终端里开不出全屏界面，要说人话并指路 `agent run`，而不是吐一堆控制字符。"""
-    from agent.client.main import tui_problem
+    from agent.client.ui import tui_problem
 
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
     problem = tui_problem()
@@ -103,7 +104,7 @@ def _bar(tui: ChatTUI) -> str:
 
 def test_status_bar_has_its_own_palette() -> None:
     """状态栏要有固定底色：`reverse` 在深色终端上会翻成一条白条，单调又晃眼。"""
-    from agent.client.main import TUI_STYLE
+    from agent.client.ui import TUI_STYLE
 
     assert "bg:" in TUI_STYLE["bar"], "底色挂在 bar 上，Window 才能铺满整行"
     assert "reverse" not in TUI_STYLE["bar"]
@@ -246,7 +247,7 @@ def test_logging_is_routed_into_the_transcript() -> None:
     """日志得走界面：logging 的 handler 抓的是原始 stderr，会绕过界面把屏幕涂花。"""
     import logging
 
-    from agent.client.main import _TuiLogHandler
+    from agent.client.tui import _TuiLogHandler
 
     tui = ChatTUI(ChatStatus())
     record = logging.LogRecord(
@@ -265,7 +266,7 @@ def test_logging_is_routed_into_the_transcript() -> None:
 
 def test_stray_stdout_writes_land_in_the_transcript() -> None:
     """会话期间谁写 stdout 都进界面日志，而不是去擦屏（那正是"屏幕闪一下"的来源）。"""
-    from agent.client.main import _TuiOutput
+    from agent.client.tui import _TuiOutput
 
     tui = ChatTUI(ChatStatus())
     guard = _TuiOutput(tui)
@@ -455,7 +456,7 @@ def test_code_fences_are_hidden_and_highlighted() -> None:
 
 def test_wrapping_counts_chinese_as_two_columns() -> None:
     """折行要按显示宽度算，否则取到的"最后几行"会对不上。"""
-    from agent.client.main import _wrap_fragments
+    from agent.client.ui import _wrap_fragments
 
     assert _texts(_wrap_fragments([("", "中文字")], 4)) == ["中文", "字"]
     assert _texts(_wrap_fragments([], 10)) == [""]
@@ -464,7 +465,7 @@ def test_wrapping_counts_chinese_as_two_columns() -> None:
 
 def test_fit_pads_and_truncates_by_display_width() -> None:
     """状态栏的"制表位"：补到固定宽度，太长就截断（中文算 2 列）。"""
-    from agent.client.main import _fit
+    from agent.client.ui import _fit
 
     assert _fit("abc", 6) == "abc   "
     assert _fit("abcdef", 4) == "abc…", "留一列给省略号"
@@ -475,7 +476,7 @@ def test_fit_pads_and_truncates_by_display_width() -> None:
 
 def test_approval_lines_show_what_will_run() -> None:
     """审批的意义就是让人看清要跑什么：shell 命令直接摊开，不用自己解 JSON。"""
-    from agent.client.main import approval_lines
+    from agent.client.ui import approval_lines
 
     lines = approval_lines(
         {"name": "shell_exec", "args": {"command": "uv run pytest -q"}, "reason": "写操作"}
@@ -492,7 +493,7 @@ def test_approval_lines_show_what_will_run() -> None:
 
 def test_approval_lines_stay_readable_for_a_huge_command() -> None:
     """审批要看清，但也不能糊一屏：逐行裁宽度、整体压行数，裁了多少写清楚。"""
-    from agent.client.main import approval_lines
+    from agent.client.ui import approval_lines
 
     command = "\n".join(f"echo 第{index}行" + "很长" * 40 for index in range(30))
     lines = approval_lines({"name": "shell_exec", "args": {"command": command}}, width=60)
@@ -546,7 +547,7 @@ async def test_confirm_does_not_swallow_a_typed_ahead_message() -> None:
 
 async def test_ask_in_tui_renders_request_and_answer() -> None:
     """整条链路：请求上屏 → 等回答 → 结果落地 → 回到"这一轮还在跑"的状态。"""
-    from agent.client.main import _ask_in_tui
+    from agent.client.tui import _ask_in_tui
 
     tui = ChatTUI(ChatStatus())
     status = ChatStatus()
@@ -567,7 +568,7 @@ def test_session_choices_are_aligned() -> None:
     """resume 选单：值取 session_id，标签按显示宽度对齐（中文两列）。"""
     from prompt_toolkit.utils import get_cwidth
 
-    from agent.client.main import session_choices
+    from agent.client.ui import session_choices
 
     choices = session_choices(
         [
@@ -621,7 +622,7 @@ def _event(seq: int, kind: str, data: dict[str, Any] | None = None) -> Any:
 
 async def test_restore_backlog_draws_the_history() -> None:
     """恢复会话时先画历史，而且用跟实时一样的行类型（用户/思考/工具/正文）。"""
-    from agent.client.main import _restore_backlog
+    from agent.client.tui import _restore_backlog
 
     events = [
         _event(1, "turn.started", {"prompt": "第一问"}),
@@ -647,7 +648,7 @@ async def test_restore_backlog_draws_the_history() -> None:
 
 async def test_session_picker_deletes_after_arming() -> None:
     """选择框里删会话：上膛才变红、真删要等第二次按；删不掉要显示原因。"""
-    from agent.client.main import _SessionPicker
+    from agent.client.tui import _SessionPicker
 
     deleted: list[str] = []
 
@@ -681,7 +682,7 @@ async def test_session_picker_deletes_after_arming() -> None:
 
 async def test_session_picker_survives_deleting_the_last_session() -> None:
     """删到最后一个也不能炸：`_leave` 在界面没跑的时候要安静跳过。"""
-    from agent.client.main import _SessionPicker
+    from agent.client.tui import _SessionPicker
 
     async def deleter(_session_id: str) -> None:
         return None

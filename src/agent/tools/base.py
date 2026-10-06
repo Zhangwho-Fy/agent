@@ -25,8 +25,9 @@ class ToolContext(BaseModel):
     workspace: Path
     timeout_s: float = 60.0
     output_limit_bytes: int = 8192
-    #: 会话库。只有 `recall`（取回被压缩的工具原文）用得上，可以不传
-    db: Any = None
+    #: 按 call_id 取回工具调用记录的回调（只有 `recall` 用得上，可以不传）。
+    #: 由装配层注入 store 的函数——**工具不认识数据库**，它们只知道"有个取回原文的入口"。
+    fetch_tool_call: Callable[[str], Awaitable[Any]] | None = None
 
 
 class ToolResult(BaseModel):

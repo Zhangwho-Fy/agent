@@ -276,7 +276,11 @@ async def test_recall_returns_the_original_output(store: Database, tmp_path: Pat
         tier="read",
     )
     await repo.finish_tool_call(store, "call_1", status="ok", decision="auto", result="原始全文")
-    ctx = ToolContext(workspace=tmp_path, db=store)
+    # 工具不认识数据库：装配层把"按 call_id 取回原文"包成回调交给它
+    ctx = ToolContext(
+        workspace=tmp_path,
+        fetch_tool_call=lambda call_id: repo.get_tool_call(store, call_id),
+    )
 
     result = await RECALL_TOOL.run({"call_id": "call_1"}, ctx)
     missing = await RECALL_TOOL.run({"call_id": "nope"}, ctx)
