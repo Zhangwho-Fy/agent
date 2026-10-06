@@ -47,6 +47,16 @@ class CaseResult:
     tools: list[str] = field(default_factory=list)
     status: str = "done"
     error: str | None = None
+    #: L2：成本与效率。数据来自 `TurnResult.usage` 和事件流，不额外采集（D62）
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tool_rounds: int = 0
+    max_tool_rounds: int = 0
+
+    @property
+    def hit_round_limit(self) -> bool:
+        """这一轮是不是因为工具往返用尽才收尾的——"过了但代价不对"的典型信号。"""
+        return self.max_tool_rounds > 0 and self.tool_rounds >= self.max_tool_rounds
 
 
 @dataclass(slots=True)
@@ -65,14 +75,36 @@ class Report:
     def rate(self) -> float:
         return self.passed / len(self.results) if self.results else 0.0
 
+    @property
+    def totals(self) -> dict[str, int]:
+        """整套用例的总量：通过率之外的代价（L2）。"""
+        return {
+            "input_tokens": sum(r.input_tokens for r in self.results),
+            "output_tokens": sum(r.output_tokens for r in self.results),
+            "tool_rounds": sum(r.tool_rounds for r in self.results),
+            "duration_ms": sum(r.duration_ms for r in self.results),
+        }
+
     def as_text(self) -> str:
         lines = [f"golden 通过率：{self.passed}/{len(self.results)} = {self.rate:.0%}"]
         for result in self.results:
             mark = "✅" if result.passed else "❌"
             tools = ",".join(result.tools) or "-"
-            lines.append(f"  {mark} {result.case.id}｜{result.duration_ms}ms｜工具 {tools}")
+            cost = (
+                f"{result.duration_ms}ms｜工具 {result.tool_rounds} 轮({len(result.tools)} 次)"
+                f"｜token {result.input_tokens}+{result.output_tokens}"
+            )
+            if result.hit_round_limit:
+                cost += "｜⚠️ 撞上轮数上限"
+            lines.append(f"  {mark} {result.case.id}｜{cost}")
+            lines.append(f"      工具序列 {tools}")
             for failure in result.failures:
                 lines.append(f"      - {failure}")
+        totals = self.totals
+        lines.append(
+            f"  合计｜{totals['duration_ms']}ms｜工具 {totals['tool_rounds']} 轮"
+            f"｜token {totals['input_tokens']}+{totals['output_tokens']}"
+        )
         return "\n".join(lines)
 
 
@@ -152,6 +184,12 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
         )
 
     tools = [str(event.data.get("name", "")) for event in events if event.type.value == "tool.call"]
+    # 工具往返次数：事件里的 round 是工具节点自增的，比 len(tools) 更准
+    # （一次模型回复可以带多个工具调用，那算一轮）
+    rounds = [
+        int(event.data.get("round", 0)) for event in events if event.type.value == "tool.call"
+    ]
+    usage = result.usage or {}
     outcome = CaseResult(
         case=case,
         passed=False,
@@ -160,6 +198,10 @@ async def run_case(case: Case, *, repo_root: Path) -> CaseResult:
         duration_ms=result.duration_ms,
         tools=tools,
         status=result.status,
+        input_tokens=int(usage.get("input_tokens", 0)),
+        output_tokens=int(usage.get("output_tokens", 0)),
+        tool_rounds=max(rounds, default=0),
+        max_tool_rounds=settings.max_tool_rounds,
     )
     outcome.failures = _check(case.checks, outcome, workspace, events)
     outcome.passed = not outcome.failures

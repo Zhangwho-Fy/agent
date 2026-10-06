@@ -33,6 +33,23 @@ async def test_golden_set_passes() -> None:
     assert report.failed == 0, "有 golden 用例没通过：\n" + report.as_text()
 
 
+async def test_golden_report_carries_cost_and_efficiency() -> None:
+    """L2（docs/design.md 第 10.2 节）：报告要能看出"过了，但代价不对"。
+
+    断言的是**报告里真的有这些数字**，不是某个具体阈值——阈值要等积累几次基线再定。
+    """
+    report = await run_all(load_cases(CASES_DIR), repo_root=REPO_ROOT)
+    text = report.as_text()
+
+    assert "token" in text, "报告没有 token 列"
+    assert "轮" in text, "报告没有工具往返次数"
+    assert "合计" in text, "报告没有总量行"
+    totals = report.totals
+    assert totals["input_tokens"] > 0, "回放夹具带了 usage，聚合不应该是 0"
+    # 每条用例都要有轮数上限的依据，否则 hit_round_limit 永远是 False
+    assert all(result.max_tool_rounds > 0 for result in report.results)
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="没有 git，跳过仓库检查")
 def test_fixtures_are_tracked_by_git() -> None:
     """夹具必须真的在仓库里，而不只是在本机磁盘上。

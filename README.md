@@ -11,7 +11,7 @@
 - **会话持久化**：事件、消息、工具调用、审批、token 用量全部落 SQLite
 - **崩溃恢复**：跑到一半 `kill -9`，重启后把没跑完的 turn 标成 `interrupted`，同一会话可以接着聊
 - **可重放**：`agent replay` 不调模型，把一次会话的事件流按 seq 原序还原
-- **可评测**：golden 集走回放执行，**不联网、不要密钥、几秒出通过率**
+- **可评测**：分四档、按代价递进。**L1** golden 集走回放执行（不联网、不要密钥、几秒出通过率），**L2** 从已有事件里聚合 token / 工具往返 / 耗时，`scripts/scan_sessions.py` 还能只读扫真实会话找异常；L3（LLM judge）与 L4（真实任务成功率）写死了触发条件，暂缓
 - **服务化**：`agent serve` 提供 HTTP + SSE（任务在服务端跑，客户端只是订阅者），断线重连按 `Last-Event-ID` 补齐；`agent chat` 是配套的交互式 CLI
 - **交互式界面**：`agent chat` 是全屏常驻界面（状态栏 + 输入行钉在最底，日志在内滚动）；思考过程暗灰可折叠、代码高亮、写操作当场问你、`agent resume` 挑历史会话并先把历史画出来
 - **代码检索（RAG）**：已接成 `search_code` 工具——agent 自己会搜代码，先拿到"文件 + 行号 + 片段"（L0），再决定要不要读全文。切块 + FTS5 词法 + 向量语义 + RRF 混合排序，10 条查询 **recall@5 = 100%、MRR = 0.787**（离线跑，不联网；这个数只当回归基线）
@@ -61,6 +61,7 @@ uv run agent resume                # 列出历史会话，挑一个继续（历�
 ```bash
 uv run pytest -q                       # 全部测试：不需要联网、不需要密钥
 uv run pytest tests/eval -s            # golden 集，打印通过率
+uv run python scripts/scan_sessions.py # 扫会话库找异常模式（只读）
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -89,14 +90,15 @@ AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run age
 | 上下文工程（提示词分层、技能、状态块、压缩） | ✅ |
 | 检索接入 R0（`search_code` 工具、索引懒建 / mtime 增量） | ✅ |
 | 用户记忆（独立 `memory.db`、写入 / 检索 / 每轮摘要） | ✅ P0 + P1 机制；P2 整理与三层评测待做 |
+| 评测体系（L1 断言 + L2 成本与效率；L3 / L4 暂缓） | ✅ L1 / L2 |
 | 6 扩展（MCP 适配器、可选 C++ 工具） | 暂缓：没有真实需求前不引入（MCP 的价值是接第三方生态，代价是沙箱语义变弱） |
 
 编排用 LangGraph，模型接入用 LangChain；自研的是框架**不覆盖**的那层语义：对外事件契约、幂等与恢复、沙箱与审批策略、录放与评测。
 
 ## 文档
 
-设计文档（`docs/design.md`，含事件与 HTTP 契约、上下文工程、用户记忆与 RAG，以及
-D1 ~ D60 决策记录）、图文版（`docs/context-engineering.html`，**两页**：
-① 上下文工程 ② 用户记忆与 RAG）和**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
+设计文档（`docs/design.md`，含事件与 HTTP 契约、上下文工程、用户记忆与 RAG、评测体系，
+以及 D1 ~ D66 决策记录）、图文版（`docs/context-engineering.html`，**三页**：
+① 上下文工程 ② 用户记忆与 RAG ③ 评测体系）和**交接文档**（`AGENTS.md`：当前状态、换机器继续的步骤、
 代码地图、踩过的坑）都是**本地文档**，已从版本控制移除——克隆这个仓库不会有它们，
 仓库里只有代码、测试和这份 README。
