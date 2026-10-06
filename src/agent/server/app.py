@@ -30,6 +30,7 @@ from ..config import Settings
 from ..core.bus import EventBus
 from ..core.ids import new_id
 from ..graph.checkpointer import open_checkpointer
+from ..logging import log_extra
 from ..store import repo
 from ..store.db import Database
 from .runtime import SessionRuntime
@@ -75,7 +76,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 崩溃恢复：进程都重启了，还挂在 running 的 turn 不可能还在跑
         recovered = await repo.interrupt_running_turns(state.db)
         if recovered:
-            logger.warning("恢复：%d 个没跑完的 turn 已标记为 interrupted", recovered)
+            logger.warning(
+                "启动恢复：没跑完的 turn 已标记为 interrupted",
+                extra=log_extra(recovered=recovered),
+            )
         state.checkpointer = open_checkpointer(settings.resolved_db_path)
         try:
             yield
@@ -182,7 +186,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 result = await runtime.run_turn(prompt, turn_id=turn_id)
             except Exception:
-                logger.exception("turn 执行失败：%s", turn_id)
+                logger.exception(
+                    "turn 执行失败",
+                    extra=log_extra(session_id=session_id, turn_id=turn_id),
+                )
                 await repo.finish_turn(state.db, turn_id, status="failed")
                 return
             await repo.append_message(

@@ -72,6 +72,10 @@ AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run agent run "任务"
 AGENT_PROVIDER=replay AGENT_TRACE_PATH=evals/recordings/my-case.jsonl uv run agent run "任务"
 ```
 
+**日志**：一行一条 JSON 写 stderr；要留档就设 `AGENT_LOG_PATH`（按 2MB × 3 份轮转）。
+`agent serve` 没配时默认写到会话库旁边的 `agent.log`。日志只装异常与降级路径——
+正常路径的事实都在事件里（`agent replay` 看得到）。
+
 ## 状态
 
 | 阶段 | 状态 |

@@ -28,6 +28,7 @@ from ..core.compress import (
 )
 from ..core.events import EventType
 from ..core.reliability import EventEmitter
+from ..logging import log_extra
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,15 @@ def build_compress_node(
                         failures += 1
                 except Exception:
                     failures += 1
-                    logger.exception("压缩失败（连续第 %d 次，阈值 %d）", failures, max_failures)
+                    logger.exception(
+                        "压缩失败",
+                        extra=log_extra(
+                            session_id=emitter.session_id,
+                            turn_id=state.get("turn_id"),
+                            failures=failures,
+                            max_failures=max_failures,
+                        ),
+                    )
 
         if not pointerized and not summarized:
             return {}

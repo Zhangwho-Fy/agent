@@ -25,6 +25,7 @@ from ..core.guard import scan_suspicious, strip_invisible, wrap_untrusted
 from ..core.prompt import STATIC_CORE
 from ..core.reliability import EventEmitter
 from ..core.status import StatusSnapshot, ToolStat
+from ..logging import log_extra
 from ..store import repo
 from ..store.db import Database
 from ..tools.base import ToolContext
@@ -306,7 +307,15 @@ def build_tool_node(
                     **detail,
                 )
                 if flagged:
-                    logger.warning("工具结果命中可疑模式 %s（%s）", flagged, name)
+                    logger.warning(
+                        "工具结果命中可疑模式",
+                        extra=log_extra(
+                            session_id=emitter.session_id,
+                            turn_id=turn_id,
+                            tool=name,
+                            rules=flagged,
+                        ),
+                    )
             results.append(ToolMessage(content=content, tool_call_id=call_id))
             await emitter.emit(
                 EventType.TOOL_RESULT,

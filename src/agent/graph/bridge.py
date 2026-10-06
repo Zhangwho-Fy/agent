@@ -28,6 +28,7 @@ from langgraph.types import Command
 
 from ..core.events import EventType
 from ..core.reliability import EventEmitter
+from ..logging import log_extra
 
 logger = logging.getLogger(__name__)
 
@@ -220,17 +221,31 @@ async def _resolve_approvals(
 
     denied = {request["call_id"]: False for request in requests}
     if approver is None:
-        logger.warning("有待审批的调用但没有审批通道，按拒绝处理：%s", list(denied))
+        logger.warning(
+            "有待审批的调用但没有审批通道，按拒绝处理",
+            extra=log_extra(session_id=emitter.session_id, turn_id=turn_id, call_ids=list(denied)),
+        )
         return denied, "当时没有审批通道"
 
     try:
         async with asyncio.timeout(timeout_s):
             granted = await approver(requests)
     except TimeoutError:
-        logger.warning("审批超时（%ss），按拒绝处理：%s", timeout_s, list(denied))
+        logger.warning(
+            "审批超时，按拒绝处理",
+            extra=log_extra(
+                session_id=emitter.session_id,
+                turn_id=turn_id,
+                timeout_s=timeout_s,
+                call_ids=list(denied),
+            ),
+        )
         return denied, f"等了 {timeout_s:g} 秒没人应答"
     except Exception:
-        logger.exception("审批回调出错，按拒绝处理")
+        logger.exception(
+            "审批回调出错，按拒绝处理",
+            extra=log_extra(session_id=emitter.session_id, turn_id=turn_id),
+        )
         return denied, "审批通道出错了"
 
     if isinstance(granted, bool):

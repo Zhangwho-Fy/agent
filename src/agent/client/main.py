@@ -45,6 +45,10 @@ app = typer.Typer(
 )
 console = Console()
 
+#: 顶层 callback 解析出来的日志级别。子命令要**再配一次**日志（比如 serve 要加文件
+#: handler）时得沿用同一个级别，不能自己拿 settings 覆盖掉用户传的 `--log-level`。
+_active_log_level = "info"
+
 #: doctor 需要确认能导入的第三方依赖
 REQUIRED_MODULES = ("pydantic", "pydantic_settings", "openai", "fastapi", "typer", "rich")
 
@@ -1251,8 +1255,10 @@ def main(
     log_level: str | None = typer.Option(None, "--log-level", help="日志级别，默认取配置里的值"),
 ) -> None:
     """所有子命令共用的入口：先把日志配好。"""
+    global _active_log_level
     settings = Settings()
-    configure_logging(log_level or settings.log_level)
+    _active_log_level = log_level or settings.log_level
+    configure_logging(_active_log_level, path=settings.log_path or None)
 
 
 @app.command()
@@ -1800,6 +1806,12 @@ def serve(
     if not settings.auth_token:
         # 默认不是"没有校验"：没配就现生成一个，本地开发也走同一套路径
         settings.auth_token = secrets.token_urlsafe(16)
+
+    # 长驻进程的日志不该只留在终端里：没配 AGENT_LOG_PATH 就写到会话库旁边
+    configure_logging(
+        _active_log_level,
+        path=settings.log_path or (settings.resolved_db_path.parent / "agent.log"),
+    )
 
     import uvicorn
 

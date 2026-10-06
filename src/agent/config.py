@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     auth_token: str = Field(default="", description="客户端调用凭证，空则由服务端生成")
     db_path: Path = Path("~/.local/share/agent/agent.db")
     log_level: str = "info"
+    log_path: str = Field(
+        default="",
+        description=(
+            "日志落盘路径（AGENT_LOG_PATH）。留空只写 stderr；"
+            "agent serve 没配时默认写到会话库旁边，按 2MB × 3 份轮转"
+        ),
+    )
 
     # ---- 派生属性 ----
     @property

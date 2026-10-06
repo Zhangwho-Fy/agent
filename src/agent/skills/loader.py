@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from ..logging import log_extra
+
 logger = logging.getLogger(__name__)
 
 #: 内置技能目录：随包发布，**在工作区之外**，所以 `fs_read` 够不着，只能走 skill_load。
@@ -89,15 +91,15 @@ def _parse(path: Path) -> tuple[str, str, str] | None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:  # pragma: no cover - 权限之类
-        logger.warning("技能读取失败 %s：%s", path, exc)
+        logger.warning("技能读取失败", extra=log_extra(skill_file=str(path), error=str(exc)))
         return None
     if not text.startswith("---"):
-        logger.warning("技能缺少 frontmatter，跳过：%s", path)
+        logger.warning("技能缺少 frontmatter，跳过", extra=log_extra(skill_file=str(path)))
         return None
 
     end = text.find("\n---", 3)
     if end < 0:
-        logger.warning("技能 frontmatter 没有结束标记，跳过：%s", path)
+        logger.warning("技能 frontmatter 没有结束标记，跳过", extra=log_extra(skill_file=str(path)))
         return None
 
     fields: dict[str, str] = {}
@@ -109,7 +111,7 @@ def _parse(path: Path) -> tuple[str, str, str] | None:
     name = fields.get("name", "").strip()
     description = one_line(fields.get("description", ""))
     if not NAME_PATTERN.match(name) or not description:
-        logger.warning("技能名不合规或缺 description，跳过：%s", path)
+        logger.warning("技能名不合规或缺 description，跳过", extra=log_extra(skill_file=str(path)))
         return None
     return name, description, text[end + 4 :].lstrip("\n")
 
@@ -158,7 +160,10 @@ def render_catalog(skills: list[Skill]) -> str:
     if overflow:
         names = " ".join(_escape(skill.name) for skill in overflow[:MAX_OVERFLOW_NAMES])
         lines.append(f'  <more count="{len(overflow)}">{names}</more>')
-        logger.warning("技能目录超过 %d 条，有 %d 条只列了名字", MAX_SKILLS, len(overflow))
+        logger.warning(
+            "技能目录超上限，超出的只列名字",
+            extra=log_extra(limit=MAX_SKILLS, overflow=len(overflow)),
+        )
     lines.append("</skills>")
     return "\n".join(lines)
 

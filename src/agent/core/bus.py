@@ -113,7 +113,12 @@ class EventBus:
         if dropped:
             logger.warning(
                 "事件推送积压，已丢弃最老的事件",
-                extra={"session_id": event.session_id, "dropped": dropped, "seq": event.seq},
+                extra={
+                    "session_id": event.session_id,
+                    "turn_id": event.turn_id,
+                    "dropped": dropped,
+                    "seq": event.seq,
+                },
             )
         return dropped
 
